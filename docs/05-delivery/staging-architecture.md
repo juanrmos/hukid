@@ -66,7 +66,7 @@ flowchart TB
 
 Dentro de `web`, `/console/*` y `/healthz` pasan a `api`; el resto sirve el build estático con `index.html` como respaldo.
 
-Aunque la `api` registra las rutas del wallet (`/oid4vp/request/*`, `/oid4vp/response`) y la API de operador con Bearer (`/v1/operator/...`), el `Caddyfile` no las enruta: desde fuera caen en el respaldo estático (un `POST /oid4vp/response` da 405). La consola lee las verificaciones por `/console/api/tenants/{id}/verification-sessions`.
+El `Caddyfile` enruta a la `api`, además de `/console/*` y `/healthz`, solo las rutas del wallet (`/oid4vp/request/*`, `/oid4vp/response`) y los endpoints de sesiones de verificación de la API de operador con Bearer (`/v1/operator/tenants/{id}/verification-sessions` y `.../{sessionId}`), con `Cache-Control: no-store`. El resto de `/v1/operator/*` (por ejemplo `/me`) no se enruta y cae en el respaldo estático. La autenticación de cada ruta la hace la `api` (wallet por identificador y `state` de un solo uso; operador por Bearer y step-up). La consola lee las verificaciones por `/console/api/tenants/{id}/verification-sessions`.
 
 ## Módulo de verificación
 

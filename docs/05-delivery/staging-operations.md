@@ -18,7 +18,7 @@ El compose monta el módulo de verificación (FEAT-004, [ADR-0033](../decisions/
 
 - **Clave maestra:** `HUKID_VERIFICATION_KEY` cifra las claves de firma de cada tenant. Se genera una sola vez con `node scripts/staging-secrets.mjs` y no se regenera ni se rota sin un plan: lo ya cifrado quedaría ilegible. Conservar una copia fuera del servidor.
 - **Emisores:** `deploy/staging/issuer-keys.json` es un marcador con una clave pública sintética (la privada se descartó). No hay ningún emisor real de confianza hasta que exista la resolución por JWKS (VER-T12).
-- **Superficie pública:** el `Caddyfile` solo enruta `/console/*` y `/healthz`. Las rutas del wallet (`/oid4vp/*`) y la API de operador con Bearer no se exponen todavía; la consola lee las verificaciones por `/console/api`.
+- **Superficie pública:** el `Caddyfile` enruta `/console/*`, `/healthz`, las rutas del wallet (`/oid4vp/request/*`, `/oid4vp/response`) y los endpoints `/v1/operator/tenants/{id}/verification-sessions[/{sessionId}]` de la API Bearer. No enruta el resto de `/v1/operator/*`. La consola sigue leyendo las verificaciones por `/console/api`.
 - **Sin configuración de verifier por tenant:** iniciar sesiones y el wallet real siguen fuera de este despliegue; la vista Verificaciones es de solo lectura.
 
 ## Membresía huérfana por un `bootstrap` con subject inventado
