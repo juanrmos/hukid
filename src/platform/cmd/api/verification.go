@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"net/http"
@@ -140,6 +142,8 @@ func configureVerification(ctx context.Context, operators *privateapi.Handler, l
 		Starter:   &postgres.VerificationStartStore{Pool: pool},
 		Sessions:  sessions,
 		Now:       time.Now,
+		Reader:    &postgres.VerificationReadStore{Pool: pool},
+		CursorKey: cursorKey(config.Key),
 	}
 	verifiers := &tenantVerifiers{base: base, pool: pool, byTenant: map[string]*verification.Verifier{}}
 	wallet := &oid4vphttp.Handler{
@@ -150,4 +154,12 @@ func configureVerification(ctx context.Context, operators *privateapi.Handler, l
 		Now:         time.Now,
 	}
 	return func(mux *http.ServeMux) { starts.Register(mux); wallet.Routes(mux) }, pool.Close, nil
+}
+
+// cursorKey derives the list-cursor authentication key from the master key, so
+// no new secret has to be provisioned and the master key itself never signs.
+func cursorKey(master []byte) []byte {
+	mac := hmac.New(sha256.New, master)
+	mac.Write([]byte("hukid.verification.cursor-key.v1"))
+	return mac.Sum(nil)
 }
