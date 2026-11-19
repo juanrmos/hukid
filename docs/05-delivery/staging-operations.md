@@ -22,6 +22,15 @@ El compose monta el módulo de verificación (FEAT-004, [ADR-0033](../decisions/
 - **Verifier del tenant (2026-11-19):** el tenant en uso (`100049a5-1527-428a-8dda-360c2e36289c`, el de los eventos de auditoría de un login real) quedó configurado con `verifierctl configure` y `verifierctl provision-key`. Convención de `client_id`: `x509_san_dns:<host público>` (perfil §12), aquí `x509_san_dns:hukid.zentrycore.com`; `response_uri`: `https://<host público>/oid4vp/response`. La clave de firma es de staging, generada y cifrada con la clave maestra; la `kid` activa la devuelve `provision-key`. **Límite:** el request object no lleva todavía la cadena `x5c` cuyo SAN coincida con el `client_id`; un wallet estricto con ese prefijo lo rechazará hasta que el owner decida el certificado (ADR-0034, perfil §12).
 - **Pendiente:** la consola no inicia sesiones; el inicio es por la API Bearer del operador. La vista Verificaciones es de solo lectura.
 
+## Purga de retención de la verificación
+
+`verification.purge_sessions` y `verification.purge_retired_keys` borran sesiones vencidas y claves retiradas sin sesión pendiente. Las ejecuta un login de mantenimiento propio, no el de la API ni `hukid_admin`:
+
+- La migración `0015` crea el rol `hukid_verification_maintenance` (sin login ni privilegios) con `EXECUTE` solo sobre esas dos funciones y `USAGE` sobre el esquema `verification`. No puede leer ni escribir sesiones, claves ni configuraciones.
+- `stagingdb runtime-logins` crea el login `hukid_staging_verification_maintenance` solo si existe `HUKID_RUNTIME_PASSWORD_VERIFICATION_MAINTENANCE` (el generador `staging-secrets.mjs` la crea; 32 a 128 caracteres en `[A-Za-z0-9_-]`). Va después de `migrate`: sin el rol, la creación falla y se revierte entera.
+- La purga se ejecuta con `verifierctl purge <días> <límite>` y `HUKID_DATABASE_URL` apuntando a ese login (la retención aprobada es 30 días). `configure` y `provision-key` siguen necesitando el login privilegiado.
+- **Estado:** implementado y probado contra Postgres 18 en contenedor (el rol solo ejecuta las dos purgas y recibe `42501` en todo lo demás). **No aplicado en staging** (sigue en 14 migraciones) y **sin planificador**: falta decidir dónde corre (por ejemplo, una tarea programada de Dokploy con `verifierctl` dentro de la imagen, que hoy no lo incluye).
+
 ## Membresía huérfana por un `bootstrap` con subject inventado
 
 ### Resuelto el 2026-11-19
