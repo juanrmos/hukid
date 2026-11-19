@@ -5,9 +5,12 @@ package postgres
 import (
 	"bufio"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
@@ -100,6 +103,26 @@ func TestConsoleBrowser(t *testing.T) {
 	apiLogs := &capturedLogs{}
 	api.Env = append(api.Env, "HUKID_DASHBOARD_DATABASE_URL="+dashboardPool.Config().ConnString(),
 		"HUKID_DASHBOARD_POLICY="+dashboardPolicyPath, "HUKID_DASHBOARD_CURSOR_KEY="+base64.StdEncoding.EncodeToString(dashboardKey))
+	// The per-tenant verification mount (VER-T11-d3/e). The issuer key only has to be a valid
+	// P-256 public key: no wallet presentation is made in this journey.
+	verificationKey := make([]byte, 32)
+	if _, err := rand.Read(verificationKey); err != nil {
+		t.Fatal(err)
+	}
+	issuerKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	issuerKeysPath := filepath.Join(scratch, "issuer-keys.json")
+	issuerKeys := fmt.Sprintf(`[{"issuer":"https://issuer.browser.invalid","kid":"browser-kid","jwk":{"kty":"EC","crv":"P-256","x":%q,"y":%q}}]`,
+		base64.RawURLEncoding.EncodeToString(issuerKey.PublicKey.X.FillBytes(make([]byte, 32))),
+		base64.RawURLEncoding.EncodeToString(issuerKey.PublicKey.Y.FillBytes(make([]byte, 32))))
+	if os.WriteFile(issuerKeysPath, []byte(issuerKeys), 0600) != nil {
+		t.Fatal("cannot write test issuer keys")
+	}
+	api.Env = append(api.Env, "HUKID_VERIFICATION_DATABASE_URL="+db.pool(t, "hukid_verification_runtime").Config().ConnString(),
+		"HUKID_VERIFICATION_KEY="+base64.StdEncoding.EncodeToString(verificationKey), "HUKID_VERIFICATION_KEY_VERSION=browser-verification",
+		"HUKID_VERIFICATION_ISSUER_KEYS="+issuerKeysPath)
 	api.Stdout, api.Stderr = apiLogs, apiLogs
 	for _, proxyOrigin := range []string{"", "http://127.0.0.1:1"} {
 		rejected := exec.Command(binary)
@@ -189,6 +212,35 @@ func TestConsoleBrowser(t *testing.T) {
  FROM generate_series(1,30) n RETURNING event_id,tenant_id)
  INSERT INTO platform.outbox_events(event_id,tenant_id) SELECT event_id,tenant_id FROM seeded`, tenant)
 			}
+		case "verification-seed":
+			// Organization A: 3 pending, 1 completed, 26 expired (30, so a page of 25 is full and a
+			// second page exists). Organization B: 2 pending that must never reach A's operator.
+			mustExec(t, db.admin, `INSERT INTO verification.sessions(tenant_id,started_by,created_at,expires_at)
+ SELECT $1::uuid,$2::uuid,now()-n*interval '1 second',now()+interval '10 minutes' FROM generate_series(1,3) n`, TestTenantA, actor)
+			mustExec(t, db.admin, `INSERT INTO verification.sessions(tenant_id,started_by,status,result,codes,report_digest,created_at,expires_at,completed_at)
+ VALUES($1,$2,'completed','fail',ARRAY['format.header.alg'],decode(repeat('ab',32),'hex'),now()-interval '2 minutes',now()+interval '10 minutes',now()-interval '1 minute')`, TestTenantA, actor)
+			mustExec(t, db.admin, `INSERT INTO verification.sessions(tenant_id,started_by,created_at,expires_at)
+ SELECT $1::uuid,$2::uuid,now()-interval '1 hour'-n*interval '1 second',now()-interval '50 minutes'-n*interval '1 second' FROM generate_series(1,26) n`, TestTenantA, actor)
+			mustExec(t, db.admin, `INSERT INTO verification.sessions(tenant_id,started_by,created_at,expires_at)
+ SELECT $1::uuid,$2::uuid,now()-n*interval '1 second',now()+interval '10 minutes' FROM generate_series(1,2) n`, TestTenantB, actor)
+			rows, err := db.admin.Query(testContext, `SELECT session_id::text FROM verification.sessions WHERE tenant_id=$1`, TestTenantB)
+			if err != nil {
+				t.Fatal(err)
+			}
+			foreign := []string{}
+			for rows.Next() {
+				var id string
+				if rows.Scan(&id) != nil {
+					t.Fatal("cannot read seeded verification sessions")
+				}
+				foreign = append(foreign, id)
+			}
+			rows.Close()
+			if len(foreign) != 2 {
+				t.Fatalf("seeded %d foreign verification sessions, want 2", len(foreign))
+			}
+			json.NewEncoder(input).Encode(map[string]any{"ok": true, "foreign": foreign})
+			continue
 		case "stale-member":
 			mustExec(t, db.admin, `UPDATE tenancy.memberships SET authorization_revision=authorization_revision+1 WHERE tenant_id=$1 AND operator_identity_id<>$2`, TestTenantA, actor)
 		case "seed":
@@ -228,7 +280,7 @@ func TestConsoleBrowser(t *testing.T) {
 		t.Fatal(err)
 	}
 	privateValues = append(privateValues, secrets["clientSecret"], secrets["interactionKey"], base64.StdEncoding.EncodeToString(key), base64.StdEncoding.EncodeToString(invitationKey), base64.StdEncoding.EncodeToString(macKey))
-	privateValues = append(privateValues, base64.StdEncoding.EncodeToString(dashboardKey), base64.StdEncoding.EncodeToString(cursorKey))
+	privateValues = append(privateValues, base64.StdEncoding.EncodeToString(dashboardKey), base64.StdEncoding.EncodeToString(cursorKey), base64.StdEncoding.EncodeToString(verificationKey))
 	for _, secret := range privateValues {
 		if secret != "" && (strings.Contains(apiLogs.String(), secret) || strings.Contains(stored, secret)) {
 			t.Fatal("browser secret leaked to audit/logs")

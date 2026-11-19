@@ -15,6 +15,7 @@ from playwright.sync_api import sync_playwright, expect
 from shell_ui import USER_BUTTON, in_tenant, menu_action, switch_tenant
 from members import run_members
 from dashboard import run_dashboard
+from verifications import run_verifications
 from frontend_audit import capture, run_frontend_audit
 
 config = json.loads(sys.stdin.readline())
@@ -358,6 +359,7 @@ with sync_playwright() as playwright:
         expect(page.get_by_label('Organización', exact=True)).to_have_value('only-tenant')
         page.unroute('**/console/api/me', one_tenant)
         run_dashboard(page, context, config, database, heading, login, artifacts)
+        run_verifications(page, context, config, database, heading, login, artifacts)
         run_members(page, context, browser, config, authorize, database, heading, login, artifacts)
         run_frontend_audit(browser, origin, artifacts)
         context.close()
