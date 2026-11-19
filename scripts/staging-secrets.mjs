@@ -9,9 +9,11 @@ import { randomBytes } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
-export const ROLES = ['SESSION', 'CONTEXT', 'TENANT', 'MEMBERS', 'DASHBOARD'];
-const KEYS = ['HUKID_AUTH_KEY', 'HUKID_INVITATION_KEY', 'HUKID_INVITATION_HMAC_KEY', 'HUKID_MEMBERS_CURSOR_KEY', 'HUKID_DASHBOARD_CURSOR_KEY'];
-const VERSIONS = { HUKID_AUTH_KEY_VERSION: 'staging-1', HUKID_INVITATION_KEY_VERSION: 'staging-1' };
+export const ROLES = ['SESSION', 'CONTEXT', 'TENANT', 'MEMBERS', 'DASHBOARD', 'VERIFICATION'];
+// HUKID_VERIFICATION_KEY seals the per-tenant verifier signing keys (ADR-0034); losing or
+// rotating it makes the stored keys unreadable, so it is only ever generated once.
+const KEYS = ['HUKID_AUTH_KEY', 'HUKID_INVITATION_KEY', 'HUKID_INVITATION_HMAC_KEY', 'HUKID_MEMBERS_CURSOR_KEY', 'HUKID_DASHBOARD_CURSOR_KEY', 'HUKID_VERIFICATION_KEY'];
+const VERSIONS = { HUKID_AUTH_KEY_VERSION: 'staging-1', HUKID_INVITATION_KEY_VERSION: 'staging-1', HUKID_VERIFICATION_KEY_VERSION: 'staging-1' };
 export const MANUAL = ['HUKID_DB_ADMIN_PASSWORD'];
 const b64 = () => randomBytes(32).toString('base64');
 const hex = () => randomBytes(24).toString('hex');
