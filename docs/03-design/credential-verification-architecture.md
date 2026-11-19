@@ -56,7 +56,7 @@ flowchart LR
   LAB["Montaje de laboratorio<br/>cmd/api/oid4vplab.go"]
 
   OP -- "1 POST start" --> H1
-  CON -. "T11-e solo lectura, sin verificar en CI" .-> H2
+  CON -. "T11-e solo lectura, verificada en CI" .-> H2
   OP -- "9 GET resultado" --> H2
   H1 --> C
   H1 --> S
@@ -188,6 +188,6 @@ stateDiagram-v2
 | `Results` de producción y mapa `state` a `session_id` | Falta | El laboratorio solo imprime el reporte en la terminal. |
 | Lectura (`GET`) y replay por tenant | Falta | La lectura solo existe en el contrato. |
 | Clave de firma por tenant | Falta | Custodia abierta ([ADR-0033](../decisions/ADR-0033.md) #7). Bloquea el montaje en producción. |
-| Pantalla en la consola | Escrita, sin verificar en CI | [ADR-0031](../decisions/ADR-0031.md) #2: la primera será de solo lectura (VER-T11-e). |
+| Pantalla en la consola | Hecha (solo lectura), verificada en CI; sin prueba de navegador | [ADR-0031](../decisions/ADR-0031.md) #2: la primera será de solo lectura (VER-T11-e). |
 
 Las credenciales y los vectores son sintéticos: no hay interoperabilidad probada con un wallet, emisor o verifier externo. Completar este servicio no cierra el conformance gate del [perfil](hukid-profile.md) §12.
