@@ -14,6 +14,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	consolehttp "hukid.local/platform/internal/adapters/console"
 	"hukid.local/platform/internal/adapters/oid4vphttp"
 	"hukid.local/platform/internal/adapters/postgres"
 	"hukid.local/platform/internal/adapters/privateapi"
@@ -99,7 +100,7 @@ func (t *tenantVerifiers) For(tenant string) (*verification.Verifier, error) {
 
 // configureVerification returns the routes of the per-tenant verification
 // mount, or a no-op when it is not configured.
-func configureVerification(ctx context.Context, operators *privateapi.Handler, labEnabled bool) (func(*http.ServeMux), func(), error) {
+func configureVerification(ctx context.Context, operators *privateapi.Handler, me *consolehttp.MeHandler, labEnabled bool) (func(*http.ServeMux), func(), error) {
 	config, err := loadVerificationConfiguration()
 	if err != nil {
 		return nil, nil, err
@@ -153,7 +154,8 @@ func configureVerification(ctx context.Context, operators *privateapi.Handler, l
 		Keys:        &postgres.VerifierKeyStore{Pool: pool, Cipher: box},
 		Now:         time.Now,
 	}
-	return func(mux *http.ServeMux) { starts.Register(mux); wallet.Routes(mux) }, pool.Close, nil
+	browser := &consolehttp.VerificationHandler{Auth: me, Management: starts}
+	return func(mux *http.ServeMux) { starts.Register(mux); browser.Register(mux); wallet.Routes(mux) }, pool.Close, nil
 }
 
 // cursorKey derives the list-cursor authentication key from the master key, so

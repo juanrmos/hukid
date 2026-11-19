@@ -96,66 +96,106 @@ func (h *VerificationHandler) readReady() bool {
 	return h != nil && h.Operators != nil && h.Operators.Tenancy != nil && h.Operators.Verifier != nil && h.Reader != nil && len(h.CursorKey) >= 32
 }
 
-// authorizeRead verifies the operator and the membership capability, in that
-// order, and returns the actor. No tenant data is read before it succeeds.
-func (h *VerificationHandler) authorizeRead(ctx context.Context, r *http.Request) (actor, tenant string, err error) {
+// bearerActor verifies the operator token and resolves the local identity. No
+// tenant data is read before it succeeds.
+func (h *VerificationHandler) bearerActor(ctx context.Context, r *http.Request) (string, error) {
 	raw, err := Bearer(r)
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
 	operator, err := h.Operators.Verifier.VerifyOperator(ctx, raw)
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
 	identity, err := h.Operators.Tenancy.Me(ctx, operator)
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
-	tenant = r.PathValue("tenantId")
-	member, err := h.Operators.Tenancy.Context(ctx, identity.ActorID, tenant)
+	return identity.ActorID, nil
+}
+
+// requireRead checks the live membership and the verification:read capability.
+func (h *VerificationHandler) requireRead(ctx context.Context, actor, tenant string) error {
+	member, err := h.Operators.Tenancy.Context(ctx, actor, tenant)
 	if err != nil {
-		return "", "", err
+		return err
 	}
 	if !slices.Contains(member.Capabilities, VerificationCapabilityRead) {
-		return "", "", errVerificationForbidden
+		return errVerificationForbidden
 	}
-	return identity.ActorID, tenant, nil
+	return nil
 }
 
 func (h *VerificationHandler) list(w http.ResponseWriter, r *http.Request) {
+	h.bearerRead(w, r, "list")
+}
+
+func (h *VerificationHandler) get(w http.ResponseWriter, r *http.Request) {
+	h.bearerRead(w, r, "get")
+}
+
+func (h *VerificationHandler) bearerRead(w http.ResponseWriter, r *http.Request, kind string) {
+	ok := PrepareMethod(w, r, http.MethodGet)
 	if !h.readReady() {
-		PrepareMethod(w, r, http.MethodGet)
-		VerificationProblem(w, a.ErrDependency)
+		if ok {
+			VerificationProblem(w, a.ErrDependency)
+		}
 		return
 	}
-	if !PrepareMethod(w, r, http.MethodGet) {
+	if !ok {
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	actor, tenant, err := h.authorizeRead(ctx, r)
+	actor, err := h.bearerActor(ctx, r)
 	if err != nil {
 		VerificationProblem(w, err)
 		return
 	}
+	h.ServeRead(w, r.WithContext(ctx), actor, kind, true)
+}
+
+// ServeRead serves the list (kind "list") or one session (kind "get") for an
+// actor the caller already authenticated, after re-checking membership and the
+// verification:read capability. The caller must have run PrepareMethod. The
+// browser mount reuses it with the session cookie instead of a Bearer token.
+func (h *VerificationHandler) ServeRead(w http.ResponseWriter, r *http.Request, actor, kind string, bearer bool) {
+	fail := func(err error) { VerificationProblemFor(w, err, bearer) }
+	if !h.readReady() {
+		fail(a.ErrDependency)
+		return
+	}
+	tenant := r.PathValue("tenantId")
+	if err := h.requireRead(r.Context(), actor, tenant); err != nil {
+		fail(err)
+		return
+	}
+	if kind == "get" {
+		h.serveGet(w, r, actor, tenant, fail)
+		return
+	}
+	h.serveList(w, r, actor, tenant, fail)
+}
+
+func (h *VerificationHandler) serveList(w http.ResponseWriter, r *http.Request, actor, tenant string, fail func(error)) {
 	status, limit, rawCursor, err := parseListQuery(r)
 	if err != nil {
-		VerificationProblem(w, err)
+		fail(err)
 		return
 	}
 	var after *verificationview.Position
 	if rawCursor != "" {
 		position, err := openCursor(h.CursorKey, rawCursor, tenant, actor, status)
 		if err != nil {
-			VerificationProblem(w, err)
+			fail(err)
 			return
 		}
 		after = &position
 	}
 	// One extra row tells whether another page exists without a count query.
-	rows, err := h.Reader.List(ctx, actor, tenant, status, limit+1, after)
+	rows, err := h.Reader.List(r.Context(), actor, tenant, status, limit+1, after)
 	if err != nil {
-		VerificationProblem(w, err)
+		fail(err)
 		return
 	}
 	page := VerificationPage{Items: []verificationview.Session{}}
@@ -167,6 +207,20 @@ func (h *VerificationHandler) list(w http.ResponseWriter, r *http.Request) {
 	}
 	page.Items = append(page.Items, rows...)
 	writeJSON(w, http.StatusOK, page)
+}
+
+func (h *VerificationHandler) serveGet(w http.ResponseWriter, r *http.Request, actor, tenant string, fail func(error)) {
+	sessionID := r.PathValue("sessionId")
+	if !sessionIDPattern.MatchString(sessionID) {
+		fail(verificationview.ErrNotFound)
+		return
+	}
+	session, err := h.Reader.Get(r.Context(), actor, tenant, sessionID)
+	if err != nil {
+		fail(err)
+		return
+	}
+	writeJSON(w, http.StatusOK, session)
 }
 
 func parseListQuery(r *http.Request) (status string, limit int, cursor string, err error) {
@@ -189,35 +243,6 @@ func parseListQuery(r *http.Request) (status string, limit int, cursor string, e
 		limit = parsed
 	}
 	return status, limit, query.Get("cursor"), nil
-}
-
-func (h *VerificationHandler) get(w http.ResponseWriter, r *http.Request) {
-	if !h.readReady() {
-		PrepareMethod(w, r, http.MethodGet)
-		VerificationProblem(w, a.ErrDependency)
-		return
-	}
-	if !PrepareMethod(w, r, http.MethodGet) {
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-	actor, tenant, err := h.authorizeRead(ctx, r)
-	if err != nil {
-		VerificationProblem(w, err)
-		return
-	}
-	sessionID := r.PathValue("sessionId")
-	if !sessionIDPattern.MatchString(sessionID) {
-		VerificationProblem(w, verificationview.ErrNotFound)
-		return
-	}
-	session, err := h.Reader.Get(ctx, actor, tenant, sessionID)
-	if err != nil {
-		VerificationProblem(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, session)
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

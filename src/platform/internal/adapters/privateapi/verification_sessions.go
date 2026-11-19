@@ -195,7 +195,11 @@ var errVerificationForbidden = errors.New("verification capability required")
 
 // VerificationProblem maps errors to generic responses: nothing about the
 // verifier configuration, the store or the cause reaches the caller.
-func VerificationProblem(w http.ResponseWriter, err error) {
+func VerificationProblem(w http.ResponseWriter, err error) { VerificationProblemFor(w, err, true) }
+
+// VerificationProblemFor is VerificationProblem for either authentication
+// scheme: bearer adds the WWW-Authenticate challenge, the cookie mount does not.
+func VerificationProblemFor(w http.ResponseWriter, err error, bearer bool) {
 	switch {
 	case errors.Is(err, errVerificationForbidden):
 		writeProblem(w, 403, "forbidden", "Acceso no permitido")
@@ -208,6 +212,6 @@ func VerificationProblem(w http.ResponseWriter, err error) {
 		w.Header().Set("Retry-After", "1")
 		writeProblem(w, 503, "dependency_unavailable", "Servicio no disponible")
 	default:
-		InvitationProblem(w, err, true)
+		InvitationProblem(w, err, bearer)
 	}
 }
