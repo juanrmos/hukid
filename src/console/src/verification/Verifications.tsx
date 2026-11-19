@@ -5,6 +5,27 @@ import { date } from '../user-management/client';
 import { filterNames, message, readVerificationPage, resultNames, statusNames } from './client';
 import type { StatusFilter, VerificationPage } from './client';
 
+// The digest is shortened so rows stay scannable. Sighted users get the whole value
+// through the copy button; screen readers read it in full instead of the short form.
+function Digest({ value }: { value?: string }) {
+  const [state, setState] = useState<'idle' | 'copied' | 'failed'>('idle');
+  useEffect(() => {
+    if (state === 'idle') return;
+    const timer = setTimeout(() => setState('idle'), 2500);
+    return () => clearTimeout(timer);
+  }, [state]);
+  if (!value) return <>—</>;
+  const copy = () => {
+    void navigator.clipboard.writeText(value).then(() => setState('copied'), () => setState('failed'));
+  };
+  return <span className="digest">
+    <code aria-hidden="true" title={value}>{`${value.slice(0, 15)}…${value.slice(-8)}`}</code>
+    <span className="sr-only">{value}</span>
+    <button type="button" onClick={copy} aria-label="Copiar la huella completa del reporte">Copiar</button>
+    <span className="muted" role="status">{state === 'copied' ? 'Copiada' : state === 'failed' ? 'Error' : ''}</span>
+  </span>;
+}
+
 // Read-only list (ADR-0033 #9): result, codes and digest, never the JWS or claims.
 // Starting a verification stays an operator action outside this view.
 export function Verifications({ identity, onAccessError }: { identity: Identity; onAccessError: (status: number) => void }) {
@@ -36,12 +57,11 @@ export function Verifications({ identity, onAccessError }: { identity: Identity;
 
   if (!canRead) return <section aria-label="Verificaciones"><p role="status">No tienes permiso para consultar las verificaciones. Solicita acceso a tu administrador.</p></section>;
   return <section id="verifications" className="dashboard" aria-label="Verificaciones">
-    <div className="section-heading"><div />
-      <button disabled={loading} onClick={() => { setCursor(''); setReload(n => n + 1); }}>Actualizar verificaciones</button></div>
-    <form className="dashboard-filters" onSubmit={event => event.preventDefault()}>
+    <div className="verification-toolbar">
       <label>Estado<select value={status} onChange={e => { setCursor(''); setStatus(e.target.value as StatusFilter); }}>
         {(Object.keys(filterNames) as StatusFilter[]).map(key => <option key={key} value={key}>{filterNames[key]}</option>)}</select></label>
-    </form>
+      <button disabled={loading} onClick={() => { setCursor(''); setReload(n => n + 1); }}>Actualizar verificaciones</button>
+    </div>
     <section className="dashboard-activity" aria-labelledby="verifications-title" aria-busy={loading}>
       <h2 id="verifications-title" ref={heading} tabIndex={-1}>Sesiones de verificación</h2>
       {loading && <p role="status">Cargando verificaciones…</p>}
@@ -56,7 +76,7 @@ export function Verifications({ identity, onAccessError }: { identity: Identity;
             <td><time dateTime={item.createdAt}>{date(item.createdAt)}</time></td>
             <td><time dateTime={item.expiresAt}>{date(item.expiresAt)}</time></td>
             <td className="record-id">{item.sessionId}</td>
-            <td className="record-id">{item.reportDigest ?? '—'}</td></tr>)}</tbody></table></div>)}
+            <td><Digest value={item.reportDigest} /></td></tr>)}</tbody></table></div>)}
       <div className="actions">
         <button disabled={loading} onClick={() => { setCursor(''); setReload(n => n + 1); }}>{cursor ? 'Volver al inicio' : 'Reiniciar lista'}</button>
         {page?.nextCursor && <button disabled={loading} onClick={() => { heading.current?.focus(); setCursor(page.nextCursor!); }}>Siguiente página</button>}
