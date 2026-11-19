@@ -39,7 +39,7 @@ func validStagingIssuer(issuer string) bool {
 
 // RuntimeLoginRoles are the runtime roles the API opens pools for. Each login created
 // here is a plain member of exactly one of them (OpenRuntimePool rejects anything else).
-var RuntimeLoginRoles = []string{"session", "context", "tenant", "members", "dashboard"}
+var RuntimeLoginRoles = []string{"session", "context", "tenant", "members", "dashboard", "verification"}
 
 var runtimePassword = regexp.MustCompile(`^[A-Za-z0-9_-]{32,128}$`)
 
