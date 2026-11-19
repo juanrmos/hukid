@@ -232,11 +232,11 @@ func TestStartVerificationSessionFailsClosed(t *testing.T) {
 
 func TestStartVerificationSessionRequiresPOST(t *testing.T) {
 	_, starter, _, mux := vsRig(t, 4)
-	req := httptest.NewRequest(http.MethodGet, "/v1/operator/tenants/admin/verification-sessions", nil)
+	req := httptest.NewRequest(http.MethodPut, "/v1/operator/tenants/admin/verification-sessions", nil)
 	req.Header.Set("Authorization", "Bearer valid")
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != 405 || starter.calls != 0 {
-		t.Fatalf("GET: status %d calls %d", rec.Code, starter.calls)
+		t.Fatalf("PUT: status %d calls %d", rec.Code, starter.calls)
 	}
 }

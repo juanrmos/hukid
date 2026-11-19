@@ -1,7 +1,7 @@
 // Spec: docs/03-design/console-dashboard-interface.md#layout-de-sidebar--adr-0027
 // One public hash per view. Invitation fragments and unknown hashes never survive startup.
 export type ViewId = 'resumen' | 'actividad' | 'miembros' | 'invitaciones' |
-  'emisores' | 'definiciones' | 'solicitudes' | 'credenciales' | 'ajustes';
+  'emisores' | 'definiciones' | 'solicitudes' | 'credenciales' | 'verificaciones' | 'ajustes';
 
 export interface ViewItem {
   id: ViewId;
@@ -25,6 +25,8 @@ export const navigation: { group: string; items: ViewItem[] }[] = [
     { id: 'definiciones', label: 'Definiciones', group: 'Emisión', icon: 'file', soon: true },
     { id: 'solicitudes', label: 'Solicitudes', group: 'Emisión', icon: 'inbox', soon: true },
     { id: 'credenciales', label: 'Credenciales', group: 'Emisión', icon: 'shield', soon: true }] },
+  { group: 'Verificación', items: [
+    { id: 'verificaciones', label: 'Verificaciones', group: 'Verificación', icon: 'shield', capabilities: ['verification:read'] }] },
   { group: 'Organización', items: [
     { id: 'ajustes', label: 'Ajustes', group: 'Organización', icon: 'sliders', soon: true }] },
 ];

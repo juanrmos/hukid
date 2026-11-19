@@ -15,6 +15,7 @@ import (
 	"hukid.local/platform/internal/adapters/oid4vphttp"
 	a "hukid.local/platform/internal/authentication"
 	"hukid.local/platform/internal/oid4vp"
+	"hukid.local/platform/internal/verificationview"
 )
 
 // VerificationCapabilityStart is granted by the local membership (ADR-0033 #5).
@@ -48,10 +49,22 @@ type VerificationHandler struct {
 	Starter  VerificationStarter
 	Sessions *oid4vp.SessionStore
 	Now      func() time.Time
+	// Reader and CursorKey serve the read-only list and lookup (VER-T11-e). The
+	// key (at least 32 bytes) authenticates list cursors; without both, the read
+	// routes fail closed with 503.
+	Reader    VerificationReader
+	CursorKey []byte
 }
 
 func (h *VerificationHandler) Register(mux *http.ServeMux) {
-	mux.HandleFunc("/v1/operator/tenants/{tenantId}/verification-sessions", h.start)
+	mux.HandleFunc("/v1/operator/tenants/{tenantId}/verification-sessions", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			h.list(w, r)
+			return
+		}
+		h.start(w, r)
+	})
+	mux.HandleFunc("/v1/operator/tenants/{tenantId}/verification-sessions/{sessionId}", h.get)
 }
 
 func (h *VerificationHandler) now() time.Time {
@@ -182,10 +195,16 @@ var errVerificationForbidden = errors.New("verification capability required")
 
 // VerificationProblem maps errors to generic responses: nothing about the
 // verifier configuration, the store or the cause reaches the caller.
-func VerificationProblem(w http.ResponseWriter, err error) {
+func VerificationProblem(w http.ResponseWriter, err error) { VerificationProblemFor(w, err, true) }
+
+// VerificationProblemFor is VerificationProblem for either authentication
+// scheme: bearer adds the WWW-Authenticate challenge, the cookie mount does not.
+func VerificationProblemFor(w http.ResponseWriter, err error, bearer bool) {
 	switch {
 	case errors.Is(err, errVerificationForbidden):
 		writeProblem(w, 403, "forbidden", "Acceso no permitido")
+	case errors.Is(err, verificationview.ErrNotFound):
+		writeProblem(w, 404, "resource_not_found", "Recurso no encontrado")
 	case errors.Is(err, oid4vp.ErrStoreFull):
 		w.Header().Set("Retry-After", "5")
 		writeProblem(w, 429, "too_many_sessions", "Demasiadas sesiones abiertas")
@@ -193,6 +212,6 @@ func VerificationProblem(w http.ResponseWriter, err error) {
 		w.Header().Set("Retry-After", "1")
 		writeProblem(w, 503, "dependency_unavailable", "Servicio no disponible")
 	default:
-		InvitationProblem(w, err, true)
+		InvitationProblem(w, err, bearer)
 	}
 }

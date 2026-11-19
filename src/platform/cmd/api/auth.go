@@ -168,7 +168,7 @@ func configureHandler(ctx context.Context, address string) (http.Handler, func()
 		closePools()
 		return nil, nil, err
 	}
-	registerVerification, closeVerification, err := configureVerification(ctx, management, lab != nil)
+	registerVerification, closeVerification, err := configureVerification(ctx, management, me, lab != nil)
 	if err != nil {
 		closeDashboard()
 		closeDirectory()

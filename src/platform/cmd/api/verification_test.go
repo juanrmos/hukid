@@ -74,7 +74,7 @@ func TestVerificationMountRefusesToCoexistWithTheLaboratoryMount(t *testing.T) {
 		t.Setenv(k, v)
 	}
 	// The refusal comes before any database or file access.
-	if _, _, err := configureVerification(context.Background(), nil, true); err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+	if _, _, err := configureVerification(context.Background(), nil, nil, true); err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
 		t.Fatalf("both mounts accepted: %v", err)
 	}
 }
@@ -83,7 +83,7 @@ func TestVerificationMountIsANoOpWhenNotConfigured(t *testing.T) {
 	for k := range validVerificationEnv() {
 		t.Setenv(k, "")
 	}
-	register, closeMount, err := configureVerification(context.Background(), nil, true)
+	register, closeMount, err := configureVerification(context.Background(), nil, nil, true)
 	if err != nil || register == nil || closeMount == nil {
 		t.Fatalf("unconfigured mount must be inert even beside the laboratory: %v", err)
 	}

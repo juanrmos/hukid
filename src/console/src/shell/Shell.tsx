@@ -18,6 +18,7 @@ const descriptions: Record<string, string> = {
   actividad: 'Eventos recientes de la organización, con referencias opacas.',
   miembros: 'Gestiona el acceso a esta organización. Los cambios se comprueban al guardar.',
   invitaciones: 'Invita a personas y sigue el estado de cada invitación.',
+  verificaciones: 'Resultado de cada verificación: estado, códigos y huella del reporte, sin datos de la credencial.',
 };
 
 const soon: Record<string, { summary: string; includes: string[]; indicator: string | null }> = {
