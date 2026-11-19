@@ -7,7 +7,7 @@ Aplica a `deploy/staging/compose.yaml` en Dokploy ([ADR-0029](../decisions/ADR-0
 Una sola vez, tras el primer despliegue, con `docker compose --profile tools run --rm tools ...`:
 
 1. `migrate`: aplica las migraciones SQL con la cuenta propietaria (`hukid_admin`).
-2. `runtime-logins`: crea los seis logins de ejecución `hukid_staging_<rol>` (`session`, `context`, `tenant`, `members`, `dashboard`, `verification`), `NOSUPERUSER`, solo con la pertenencia a su rol. Es idempotente: en un staging ya aprovisionado con cinco logins, repetirlo añade `verification` y vuelve a fijar las otras contraseñas con los mismos valores. Exige las seis variables `HUKID_RUNTIME_PASSWORD_<ROL>`.
+2. `runtime-logins`: crea los seis logins de ejecución `hukid_staging_<rol>` (`session`, `context`, `tenant`, `members`, `dashboard`, `verification`), `NOSUPERUSER`, solo con la pertenencia a su rol. Es idempotente: en un staging ya aprovisionado con cinco logins, repetirlo añade `verification` y vuelve a fijar las otras contraseñas con los mismos valores. Exige las seis variables `HUKID_RUNTIME_PASSWORD_<ROL>`. Si existe `HUKID_RUNTIME_PASSWORD_VERIFICATION_MAINTENANCE`, crea además el login de purga (ver [Purga de retención](#purga-de-retención-de-la-verificación)).
 3. `bootstrap <issuer> <subject> "<nombre del tenant>"`: crea un tenant y liga una identidad real como `tenant_admin`.
 
 El `subject` es el identificador `sub` del usuario en Keycloak (un UUID). No se puede deducir: hay que leerlo del usuario real.
@@ -29,7 +29,7 @@ El compose monta el módulo de verificación (FEAT-004, [ADR-0033](../decisions/
 - La migración `0015` crea el rol `hukid_verification_maintenance` (sin login ni privilegios) con `EXECUTE` solo sobre esas dos funciones y `USAGE` sobre el esquema `verification`. No puede leer ni escribir sesiones, claves ni configuraciones.
 - `stagingdb runtime-logins` crea el login `hukid_staging_verification_maintenance` solo si existe `HUKID_RUNTIME_PASSWORD_VERIFICATION_MAINTENANCE` (el generador `staging-secrets.mjs` la crea; 32 a 128 caracteres en `[A-Za-z0-9_-]`). Va después de `migrate`: sin el rol, la creación falla y se revierte entera.
 - La purga se ejecuta con `verifierctl purge <días> <límite>` y `HUKID_DATABASE_URL` apuntando a ese login (la retención aprobada es 30 días). `configure` y `provision-key` siguen necesitando el login privilegiado.
-- **Estado:** implementado y probado contra Postgres 18 en contenedor (el rol solo ejecuta las dos purgas y recibe `42501` en todo lo demás). **No aplicado en staging** (sigue en 14 migraciones) y **sin planificador**: falta decidir dónde corre (por ejemplo, una tarea programada de Dokploy con `verifierctl` dentro de la imagen, que hoy no lo incluye).
+- **Estado:** implementado y probado contra Postgres 18 en contenedor (el rol solo ejecuta las dos purgas y recibe `42501` en todo lo demás). **Aplicado en staging el 2026-11-19** (`migrate` a 15 migraciones y `runtime-logins` con `HUKID_RUNTIME_PASSWORD_VERIFICATION_MAINTENANCE`; comprobado: `verifierctl purge 30 100` da 0 y 0, y un `SELECT` sobre `verification.sessions` da `permission denied`) y **sin planificador**: falta decidir dónde corre (por ejemplo, una tarea programada de Dokploy con `verifierctl` dentro de la imagen, que hoy no lo incluye).
 
 ## Membresía huérfana por un `bootstrap` con subject inventado
 
