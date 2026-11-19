@@ -108,3 +108,13 @@ def run_verifications(page, context, config, database, heading, login, artifacts
         go_to(page, 'Verificaciones')
     assert again.value.status == 200
     expect(rows).to_have_count(25)
+
+    # HTTP 401 returns to the provider login with a fresh session and no active organization,
+    # which is also the state the next journey starts from.
+    page.route('**/verification-sessions?*', lambda route: route.fulfill(status=401, json={'code': 'invalid_credential'}), times=1)
+    before = next(c['value'] for c in context.cookies() if c['name'] == 'hukid_test_session')
+    section.get_by_role('button', name='Actualizar verificaciones').press('Enter')
+    heading(page, 'Elige una organización')
+    expect(section).to_have_count(0)
+    assert next(c['value'] for c in context.cookies() if c['name'] == 'hukid_test_session') != before
+    assert page.evaluate('localStorage.length === 0 && sessionStorage.length === 0')
