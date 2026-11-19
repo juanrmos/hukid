@@ -39,19 +39,29 @@ func TestBrowserVerificationReadsRejectBeforeAnyStorage(t *testing.T) {
 		"/console/api/tenants/t1/verification-sessions/7a7f8c3e-5b0e-4a6b-9a39-0d6c1f3c9a11",
 	}
 	for _, path := range paths {
-		cases := map[string]func(*http.Request){
-			"no cookie":        func(*http.Request) {},
-			"duplicate cookie": func(r *http.Request) { r.AddCookie(&http.Cookie{Name: cookie, Value: "a"}); r.AddCookie(&http.Cookie{Name: cookie, Value: "b"}) },
-			"foreign cookie":   func(r *http.Request) { r.AddCookie(&http.Cookie{Name: "other", Value: "a"}) },
-			"bearer only":      func(r *http.Request) { r.Header.Set("Authorization", "Bearer valid") },
+		cases := []struct {
+			name   string
+			mutate func(*http.Request)
+		}{
+			{"no cookie", func(*http.Request) {}},
+			{"duplicate cookie", func(r *http.Request) {
+				r.AddCookie(&http.Cookie{Name: cookie, Value: "a"})
+				r.AddCookie(&http.Cookie{Name: cookie, Value: "b"})
+			}},
+			{"foreign cookie", func(r *http.Request) {
+				r.AddCookie(&http.Cookie{Name: "other", Value: "a"})
+			}},
+			{"bearer only", func(r *http.Request) {
+				r.Header.Set("Authorization", "Bearer valid")
+			}},
 		}
-		for name, mutate := range cases {
+		for _, c := range cases {
 			req := httptest.NewRequest(http.MethodGet, path, nil)
-			mutate(req)
+			c.mutate(req)
 			rec := httptest.NewRecorder()
 			mux.ServeHTTP(rec, req)
 			if rec.Code != http.StatusUnauthorized || rec.Header().Get("WWW-Authenticate") != "" || rec.Header().Get("Cache-Control") != "no-store" {
-				t.Fatalf("%s %s: status %d challenge %q cache %q", path, name, rec.Code, rec.Header().Get("WWW-Authenticate"), rec.Header().Get("Cache-Control"))
+				t.Fatalf("%s %s: status %d challenge %q cache %q", path, c.name, rec.Code, rec.Header().Get("WWW-Authenticate"), rec.Header().Get("Cache-Control"))
 			}
 		}
 		for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete} {
