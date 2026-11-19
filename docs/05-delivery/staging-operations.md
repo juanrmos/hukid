@@ -24,6 +24,10 @@ El compose monta el módulo de verificación (FEAT-004, [ADR-0033](../decisions/
 
 ## Membresía huérfana por un `bootstrap` con subject inventado
 
+### Resuelto el 2026-11-19
+
+Consultada la base, había **tres** tenants "Zentry Core", no dos: `045cb550-32ac-47c1-8ce3-07e00260d861` (subject `1b2c3d4e-5f60-7182-93a4-b5c6d7e8f901`), `79086f44-8dc5-41e6-8974-57548ab55ca9` (subject literal `TU-UUID-REAL`, de un `bootstrap` con el texto de ejemplo) y `100049a5-1527-428a-8dda-360c2e36289c` (subject real de Keycloak, el único con eventos de auditoría de un login). Los dos primeros se suspendieron con este procedimiento, adaptado a dos `UPDATE` con su propia guarda por subject en una sola transacción que se revierte si alguno no afecta exactamente una fila. Resultado leído de la base: ambos `suspended` con el nombre "Zentry Core (descartado: bootstrap con subject erróneo)", el real `active`, membresías, identidades y auditoría intactas. La consola mostrando una sola organización no se ha comprobado aún. El resto de la sección conserva el análisis original, escrito cuando se creía que eran dos tenants.
+
 ### Qué quedó, según el código
 
 `bootstrapIdentity` (`internal/adapters/postgres/bootstrap_local.go`) no reutiliza tenants: **cada ejecución con un subject nuevo crea un tenant nuevo** con ese nombre. Solo es idempotente por identidad: si `(issuer, subject)` ya existe, no hace nada. Por tanto, dos ejecuciones con dos subjects distintos dejaron, en una sola transacción cada una:
@@ -35,7 +39,7 @@ El compose monta el módulo de verificación (FEAT-004, [ADR-0033](../decisions/
 | `tenancy.memberships` + `membership_roles` | `active` + `tenant_admin` | `active` + `tenant_admin` |
 | `platform.audit_events` + `outbox_events` | `staging.bootstrap.completed` | `staging.bootstrap.completed` |
 
-Estado **inferido, no consultado**: no hay acceso a la base desde la máquina de desarrollo (no publica puerto y el usuario SSH no tiene permiso de Docker). El paso 1 de abajo lo confirma.
+Estado **inferido** cuando se escribió esta sección; la consulta del 2026-11-19 (ver arriba) mostró un tercer tenant. Desde la máquina de desarrollo se llega a la base por Tailscale (`100.78.192.113:5433`) con `psql` en un contenedor; el paso 1 de abajo sigue siendo la comprobación previa.
 
 El huérfano es inofensivo hoy: nadie puede autenticarse con ese subject (Keycloak asigna sus propios UUID), y como la consola solo lista tenants `active` con membresía `active` del operador actual, nadie lo ve. Pero hay dos tenants con el mismo nombre y una identidad administradora sin dueño.
 
@@ -84,7 +88,7 @@ COMMIT;
 
 **3. Comprobar.** Repite la consulta del paso 1 (ahora debe mostrar `suspended` y el nombre nuevo para el huérfano y `active` para el real) y entra en la consola: debe aparecer una sola organización.
 
-Verificado por lectura: ninguna de las migraciones 0001-0011 define triggers, y los cinco roles de ejecución solo tienen `SELECT` sobre `tenancy.tenants`, así que el `UPDATE` solo lo puede hacer el propietario. No verificado: el `UPDATE` en sí, que no se ha ejecutado contra la base de staging. Si fallara, la transacción se revierte y no queda nada a medias.
+Verificado por lectura: ninguna de las migraciones 0001-0011 define triggers, y los cinco roles de ejecución solo tienen `SELECT` sobre `tenancy.tenants`, así que el `UPDATE` solo lo puede hacer el propietario. El `UPDATE` se ejecutó contra staging el 2026-11-19 (ver arriba) y funcionó como se esperaba. Si fallara, la transacción se revierte y no queda nada a medias.
 
 ### ¿Debe `bootstrap` rechazar subjects que no existen en Keycloak?
 
