@@ -7,10 +7,19 @@ Aplica a `deploy/staging/compose.yaml` en Dokploy ([ADR-0029](../decisions/ADR-0
 Una sola vez, tras el primer despliegue, con `docker compose --profile tools run --rm tools ...`:
 
 1. `migrate`: aplica las migraciones SQL con la cuenta propietaria (`hukid_admin`).
-2. `runtime-logins`: crea los cinco logins de ejecución `hukid_staging_<rol>` (`session`, `context`, `tenant`, `members`, `dashboard`), `NOSUPERUSER`, solo con la pertenencia a su rol.
+2. `runtime-logins`: crea los seis logins de ejecución `hukid_staging_<rol>` (`session`, `context`, `tenant`, `members`, `dashboard`, `verification`), `NOSUPERUSER`, solo con la pertenencia a su rol. Es idempotente: en un staging ya aprovisionado con cinco logins, repetirlo añade `verification` y vuelve a fijar las otras contraseñas con los mismos valores. Exige las seis variables `HUKID_RUNTIME_PASSWORD_<ROL>`.
 3. `bootstrap <issuer> <subject> "<nombre del tenant>"`: crea un tenant y liga una identidad real como `tenant_admin`.
 
 El `subject` es el identificador `sub` del usuario en Keycloak (un UUID). No se puede deducir: hay que leerlo del usuario real.
+
+## Módulo de verificación por tenant
+
+El compose monta el módulo de verificación (FEAT-004, [ADR-0033](../decisions/ADR-0033.md) y [ADR-0034](../decisions/ADR-0034.md)) con `HUKID_VERIFICATION_DATABASE_URL`, `HUKID_VERIFICATION_KEY`, `HUKID_VERIFICATION_KEY_VERSION` y `HUKID_VERIFICATION_ISSUER_KEYS`. Si falta alguna variable obligatoria, el despliegue falla en lugar de arrancar sin el módulo.
+
+- **Clave maestra:** `HUKID_VERIFICATION_KEY` cifra las claves de firma de cada tenant. Se genera una sola vez con `node scripts/staging-secrets.mjs` y no se regenera ni se rota sin un plan: lo ya cifrado quedaría ilegible. Conservar una copia fuera del servidor.
+- **Emisores:** `deploy/staging/issuer-keys.json` es un marcador con una clave pública sintética (la privada se descartó). No hay ningún emisor real de confianza hasta que exista la resolución por JWKS (VER-T12).
+- **Superficie pública:** el `Caddyfile` solo enruta `/console/*` y `/healthz`. Las rutas del wallet (`/oid4vp/*`) y la API de operador con Bearer no se exponen todavía; la consola lee las verificaciones por `/console/api`.
+- **Sin configuración de verifier por tenant:** iniciar sesiones y el wallet real siguen fuera de este despliegue; la vista Verificaciones es de solo lectura.
 
 ## Membresía huérfana por un `bootstrap` con subject inventado
 
