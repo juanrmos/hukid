@@ -1198,6 +1198,111 @@ func (t *postgresIssuanceTx) ListAuditEvents(actionFilter string) ([]issuance.Au
 	return listAuditEventsTx(t.ctx, t.tx, actionFilter)
 }
 
+func (t *postgresIssuanceTx) PurgeExpiredIssuanceMaterial(now, cutoff time.Time, limit int) (issuance.RetentionSummary, error) {
+	var summary issuance.RetentionSummary
+	nowUTC, cutoffUTC := now.UTC(), cutoff.UTC()
+	tag, err := t.tx.Exec(t.ctx,
+		`UPDATE issuance.issuance_requests
+		 SET offer_state='expired', offer_ciphertext=NULL, offer_nonce=NULL, offer_key_version=NULL
+		 WHERE request_id IN (
+		   SELECT request_id FROM issuance.issuance_requests
+		   WHERE tenant_id=$1 AND offer_state='ready' AND expires_at <= $2
+		   ORDER BY expires_at ASC LIMIT $3 FOR UPDATE SKIP LOCKED
+		 )`,
+		t.tenantID, nowUTC, limit)
+	if err != nil {
+		return summary, err
+	}
+	summary.ExpiredOffers = int(tag.RowsAffected())
+
+	shredReqTag, err := t.tx.Exec(t.ctx,
+		`UPDATE issuance.issuance_requests
+		 SET claims_ciphertext=$4, claims_nonce=$5, claims_key_version='shredded', source_reference=''
+		 WHERE request_id IN (
+		   SELECT request_id FROM issuance.issuance_requests
+		   WHERE tenant_id=$1
+		     AND (issuance_state IN ('issued','cancelled','failed') OR offer_state='expired')
+		     AND created_at <= $2 AND claims_key_version <> 'shredded'
+		   ORDER BY created_at ASC LIMIT $3 FOR UPDATE SKIP LOCKED
+		 )`,
+		t.tenantID, cutoffUTC, limit, make([]byte, 16), make([]byte, 12))
+	if err != nil {
+		return summary, err
+	}
+	summary.ShreddedRequests = int(shredReqTag.RowsAffected())
+
+	shredVCTag, err := t.tx.Exec(t.ctx,
+		`UPDATE issuance.deferred_transactions
+		 SET vc_ciphertext=NULL, vc_nonce=NULL, vc_key_version=NULL
+		 WHERE request_id IN (
+		   SELECT request_id FROM issuance.deferred_transactions
+		   WHERE tenant_id=$1 AND status='issued' AND completed_at IS NOT NULL AND completed_at <= $2 AND vc_ciphertext IS NOT NULL
+		   ORDER BY completed_at ASC LIMIT $3 FOR UPDATE SKIP LOCKED
+		 )`,
+		t.tenantID, cutoffUTC, limit)
+	if err != nil {
+		return summary, err
+	}
+	summary.ShreddedDeferredVCs = int(shredVCTag.RowsAffected())
+	return summary, nil
+}
+
+func (t *postgresIssuanceTx) ReadOperationalMetrics() (issuance.OperationalMetrics, error) {
+	var out issuance.OperationalMetrics
+	if err := t.tx.QueryRow(t.ctx,
+		`SELECT count(*) FROM tenancy.issuers WHERE tenant_id=$1 AND state='active'`,
+		t.tenantID).Scan(&out.ActiveIssuers); err != nil {
+		return out, err
+	}
+	if err := t.tx.QueryRow(t.ctx,
+		`SELECT count(*) FROM definition.definition_versions WHERE tenant_id=$1 AND state='published'`,
+		t.tenantID).Scan(&out.PublishedDefinitions); err != nil {
+		return out, err
+	}
+	if err := t.tx.QueryRow(t.ctx,
+		`SELECT
+		   COALESCE(count(*) FILTER (WHERE issuance_state='prepared'), 0),
+		   COALESCE(count(*) FILTER (WHERE issuance_state='deferred'), 0),
+		   COALESCE(count(*) FILTER (WHERE issuance_state='failed'), 0)
+		 FROM issuance.issuance_requests WHERE tenant_id=$1`,
+		t.tenantID).Scan(&out.PreparedRequests, &out.DeferredPending, &out.DeferredFailedDLQ); err != nil {
+		return out, err
+	}
+	if err := t.tx.QueryRow(t.ctx,
+		`SELECT
+		   COALESCE(count(*) FILTER (WHERE desired_status='active'), 0),
+		   COALESCE(count(*) FILTER (WHERE desired_status='suspended'), 0),
+		   COALESCE(count(*) FILTER (WHERE desired_status='revoked'), 0)
+		 FROM status.issued_credentials WHERE tenant_id=$1`,
+		t.tenantID).Scan(&out.IssuedCredentials, &out.SuspendedCredentials, &out.RevokedCredentials); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+func (t *postgresIssuanceTx) RequeueFailedDeferredRequest(requestID string, newExpiresAt time.Time) (bool, error) {
+	txTag, err := t.tx.Exec(t.ctx,
+		`UPDATE issuance.deferred_transactions
+		 SET status='pending', error_code='', expires_at=GREATEST(expires_at, $3)
+		 WHERE tenant_id=$1 AND request_id=$2 AND status='failed'`,
+		t.tenantID, requestID, newExpiresAt.UTC())
+	if err != nil {
+		return false, err
+	}
+	if txTag.RowsAffected() != 1 {
+		return false, nil
+	}
+	reqTag, err := t.tx.Exec(t.ctx,
+		`UPDATE issuance.issuance_requests
+		 SET issuance_state='deferred'
+		 WHERE tenant_id=$1 AND request_id=$2 AND deferred=true AND issuance_state='failed'`,
+		t.tenantID, requestID)
+	if err != nil {
+		return false, err
+	}
+	return reqTag.RowsAffected() == 1, nil
+}
+
 func createIssuerWithKeyTx(
 	ctx context.Context, tx pgx.Tx, tenantID string,
 	rec issuance.IssuerRecord, kid, kmsKeyRef string, jwk issuance.PublicJWK,

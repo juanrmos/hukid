@@ -111,3 +111,13 @@ ALTER TABLE status.issued_credentials
 CREATE INDEX issued_credentials_signing_kid_idx
   ON status.issued_credentials(tenant_id, issuer_id, signing_kid)
   WHERE signing_kid <> '';
+
+-- Dashboard aggregate reads for issuance:read (createdRequests, issuedCredentials).
+-- Column-level SELECT excludes claims_ciphertext, offer_ciphertext, source_reference and jws_digest.
+GRANT USAGE ON SCHEMA issuance, status TO hukid_dashboard_runtime;
+GRANT SELECT(request_id, tenant_id, issuer_id, created_at) ON issuance.issuance_requests TO hukid_dashboard_runtime;
+GRANT SELECT(credential_id, tenant_id, issuer_id, issued_at) ON status.issued_credentials TO hukid_dashboard_runtime;
+CREATE POLICY dashboard_issuance_requests ON issuance.issuance_requests FOR SELECT TO hukid_dashboard_runtime
+  USING (tenant_id = tenancy.current_tenant());
+CREATE POLICY dashboard_issued_credentials ON status.issued_credentials FOR SELECT TO hukid_dashboard_runtime
+  USING (tenant_id = tenancy.current_tenant());

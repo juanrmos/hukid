@@ -80,7 +80,11 @@ type adminAuditDTO struct {
 func (h *IssuanceAdminHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/operator/tenants/{tenantId}/issuers", h.serveIssuers)
 	mux.HandleFunc("/v1/operator/tenants/{tenantId}/issuance-requests", h.serveOperatorRequests)
+	mux.HandleFunc("/v1/operator/tenants/{tenantId}/issuance-requests/{requestId}/replay-dlq", h.serveReplayDLQ)
 	mux.HandleFunc("/v1/operator/tenants/{tenantId}/credentials", h.serveOperatorCredentials)
+	mux.HandleFunc("/v1/operator/tenants/{tenantId}/credentials/{credentialId}/suspend", h.serveOperatorCredentialStatus("suspend"))
+	mux.HandleFunc("/v1/operator/tenants/{tenantId}/credentials/{credentialId}/reactivate", h.serveOperatorCredentialStatus("reactivate"))
+	mux.HandleFunc("/v1/operator/tenants/{tenantId}/credentials/{credentialId}/revoke", h.serveOperatorCredentialStatus("revoke"))
 	mux.HandleFunc("/v1/operator/tenants/{tenantId}/issuers/{issuerId}/keys/rotate", h.serveRotateKey)
 	mux.HandleFunc("/v1/operator/tenants/{tenantId}/issuers/{issuerId}/keys/{kid}/compromise", h.serveCompromiseKey)
 	mux.HandleFunc("/v1/operator/tenants/{tenantId}/issuers/{issuerId}/credential-definitions", h.serveDefinitions)
@@ -90,6 +94,7 @@ func (h *IssuanceAdminHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/operator/tenants/{tenantId}/clients", h.serveClients)
 	mux.HandleFunc("/v1/operator/tenants/{tenantId}/clients/{clientId}/rotate-secret", h.serveRotateClientSecret)
 	mux.HandleFunc("/v1/operator/tenants/{tenantId}/clients/{clientId}/revoke", h.serveRevokeClient)
+	mux.HandleFunc("/v1/operator/tenants/{tenantId}/issuance-metrics", h.serveOperationalMetrics)
 	mux.HandleFunc("/v1/operator/tenants/{tenantId}/audit", h.serveAudit)
 	mux.HandleFunc("/v1/operator/tenants/{tenantId}/issuance-audit", h.serveAudit)
 }
@@ -183,6 +188,81 @@ func (h *IssuanceAdminHandler) serveOperatorCredentials(w http.ResponseWriter, r
 		return
 	}
 	JSON(w, map[string]any{"items": items, "limit": filter.Limit, "offset": filter.Offset})
+}
+
+func (h *IssuanceAdminHandler) serveOperatorCredentialStatus(op string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			prepareAdminHeaders(w, r)
+			rejectMethod(w, http.MethodPost)
+			return
+		}
+		_, identity, opCtx, corrID, ok := h.authWrite(w, r, "issuers:manage", true)
+		if !ok {
+			return
+		}
+		var in issuance.StatusChangeInput
+		if !decodeStrictAdminJSON(w, r, &in, 2048) {
+			return
+		}
+		res, err := h.Service.OperatorChangeCredentialStatus(opCtx.TenantID, r.PathValue("credentialId"), op, identity.ActorID, corrID, in)
+		if err != nil {
+			issuanceAdminProblem(w, err)
+			return
+		}
+		JSON(w, res)
+	}
+}
+
+func (h *IssuanceAdminHandler) serveOperationalMetrics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		prepareAdminHeaders(w, r)
+		rejectMethod(w, http.MethodGet)
+		return
+	}
+	_, _, opCtx, _, ok := h.authRead(w, r)
+	if !ok {
+		return
+	}
+	if !slices.Contains(opCtx.Capabilities, "issuance:read") {
+		issuanceAdminProblem(w, tenancy.ErrDirectoryForbidden)
+		return
+	}
+	if r.URL.RawQuery != "" || r.URL.ForceQuery {
+		writeProblem(w, http.StatusBadRequest, "invalid_request", "Solicitud inválida")
+		return
+	}
+	metrics, err := h.Service.OperationalMetrics(opCtx.TenantID)
+	if err != nil {
+		issuanceAdminProblem(w, err)
+		return
+	}
+	JSON(w, metrics)
+}
+
+func (h *IssuanceAdminHandler) serveReplayDLQ(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		prepareAdminHeaders(w, r)
+		rejectMethod(w, http.MethodPost)
+		return
+	}
+	_, identity, opCtx, corrID, ok := h.authWrite(w, r, "issuers:manage", true)
+	if !ok {
+		return
+	}
+	if r.URL.RawQuery != "" || r.URL.ForceQuery {
+		writeProblem(w, http.StatusBadRequest, "invalid_request", "Solicitud inválida")
+		return
+	}
+	requestID := r.PathValue("requestId")
+	if err := h.Service.ReplayFailedDeferredRequest(opCtx.TenantID, requestID, identity.ActorID, corrID); err != nil {
+		issuanceAdminProblem(w, err)
+		return
+	}
+	JSON(w, map[string]any{
+		"requestId": requestID,
+		"requeued":  true,
+	})
 }
 
 func (h *IssuanceAdminHandler) now() time.Time {
@@ -888,6 +968,8 @@ func issuanceAdminProblem(w http.ResponseWriter, err error) {
 		writeProblem(w, http.StatusPreconditionFailed, "etag_mismatch", "La versión del recurso ha cambiado")
 	case errors.Is(err, issuance.ErrDefinitionImmutable):
 		writeProblem(w, http.StatusConflict, "definition_immutable", "La definición publicada o retirada es inmutable")
+	case errors.Is(err, issuance.ErrInvalidStatusTransition):
+		writeProblem(w, http.StatusConflict, "invalid_state_transition", "La transición de estado no es válida")
 	case errors.Is(err, issuance.ErrDefinitionConflict):
 		writeProblem(w, http.StatusConflict, "definition_conflict", "La definición o configurationId ya existe")
 	case errors.Is(err, issuance.ErrKeyConflict):

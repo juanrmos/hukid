@@ -65,12 +65,14 @@ func TestDashboardOverviewIsolationLivePermissionsAndNoWrites(t *testing.T) {
 			if name == "activeMembers" {
 				continue
 			}
-			wantState := "notAuthorized"
 			if name == "createdRequests" || name == "issuedCredentials" {
-				wantState = "unavailable"
+				if section.State != "available" || section.Value == nil || *section.Value != 0 || section.AsOf == nil || section.AsOf.After(o.GeneratedAt) {
+					t.Fatal("unexpected connected issuance metric state", name, section)
+				}
+				continue
 			}
-			if section.State != wantState || section.Value != nil || section.AsOf != nil {
-				t.Fatal("unexpected dashboard metric state", name, section)
+			if section.State != "notAuthorized" || section.Value != nil || section.AsOf != nil {
+				t.Fatal("unexpected reserved dashboard metric state", name, section)
 			}
 		}
 		assertCleared(t, pool)

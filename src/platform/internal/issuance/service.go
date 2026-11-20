@@ -1316,6 +1316,42 @@ func (s *Service) RevokeCredential(token IntegrationToken, idempotencyKey, crede
 	return s.changeCredentialStatus(token, idempotencyKey, credentialID, "revoke", in)
 }
 
+// OperatorChangeCredentialStatus transitions an issued credential status on behalf of an
+// authenticated tenant_admin / issuers:manage operator after fresh MFA step-up (ISS-T06 / HK-050).
+func (s *Service) OperatorChangeCredentialStatus(tenantID, credentialID, op, actorID, correlationID string, in StatusChangeInput) (StatusChangeResult, error) {
+	if strings.TrimSpace(tenantID) == "" || strings.TrimSpace(credentialID) == "" || strings.TrimSpace(actorID) == "" ||
+		len(in.ReasonCode) > 64 || len(in.Comment) > 512 || strings.ContainsAny(in.ReasonCode, " \t\r\n") {
+		return StatusChangeResult{}, ErrInvalidRequest
+	}
+	if (op == "suspend" || op == "revoke") && strings.TrimSpace(in.ReasonCode) == "" {
+		return StatusChangeResult{}, ErrInvalidRequest
+	}
+	if op != "suspend" && op != "reactivate" && op != "revoke" {
+		return StatusChangeResult{}, ErrInvalidRequest
+	}
+	now := s.now()
+	var result StatusChangeResult
+	err := s.backend.WithTenantTx(tenantID, func(tx Tx) error {
+		cred, found, err := tx.LockIssuedCredential(credentialID)
+		if err != nil {
+			return err
+		}
+		if !found || cred.TenantID != tenantID {
+			return ErrResourceNotFound
+		}
+		issuerRec, found, err := tx.GetIssuerByID(cred.IssuerID)
+		if err != nil || !found {
+			return ErrResourceNotFound
+		}
+		result, err = s.applyStatusTransitionTx(tx, cred, issuerRec, op, actorID, in.ReasonCode, correlationID, now)
+		return err
+	})
+	if err != nil {
+		return StatusChangeResult{}, err
+	}
+	return result, nil
+}
+
 func (s *Service) changeCredentialStatus(token IntegrationToken, idempotencyKey, credentialID, op string, in StatusChangeInput) (StatusChangeResult, bool, error) {
 	if len(idempotencyKey) < minIdempotencyKeyLen || len(idempotencyKey) > maxIdempotencyKeyLen ||
 		strings.TrimSpace(credentialID) == "" || len(in.ReasonCode) > 64 || len(in.Comment) > 512 ||
@@ -1375,90 +1411,97 @@ func (s *Service) changeCredentialStatus(token IntegrationToken, idempotencyKey,
 		if err != nil || !found {
 			return ErrResourceNotFound
 		}
-
-		var targetListID string
-		var targetIndex *int
-		var bitVal bool
-		var nextStatus, auditAction string
-		switch op {
-		case "suspend":
-			if cred.DesiredStatus != CredentialStatusActive || cred.SuspensionListID == "" || cred.SuspensionIndex == nil {
-				return ErrInvalidStatusTransition
-			}
-			targetListID, targetIndex, bitVal = cred.SuspensionListID, cred.SuspensionIndex, true
-			nextStatus, auditAction = CredentialStatusSuspended, "credential.suspended"
-			ts := now
-			cred.SuspendedAt = &ts
-		case "reactivate":
-			if cred.DesiredStatus != CredentialStatusSuspended || cred.SuspensionListID == "" || cred.SuspensionIndex == nil {
-				return ErrInvalidStatusTransition
-			}
-			targetListID, targetIndex, bitVal = cred.SuspensionListID, cred.SuspensionIndex, false
-			nextStatus, auditAction = CredentialStatusActive, "credential.reactivated"
-			cred.SuspendedAt = nil
-		case "revoke":
-			if cred.DesiredStatus == CredentialStatusRevoked || cred.RevocationListID == "" || cred.RevocationIndex == nil {
-				return ErrInvalidStatusTransition
-			}
-			targetListID, targetIndex, bitVal = cred.RevocationListID, cred.RevocationIndex, true
-			nextStatus, auditAction = CredentialStatusRevoked, "credential.revoked"
-			ts := now
-			cred.RevokedAt = &ts
-		default:
-			return ErrInvalidRequest
-		}
-
-		list, found, err := tx.LockStatusList(cred.IssuerID, targetListID)
-		if err != nil || !found {
-			return ErrResourceNotFound
-		}
-		if err := SetBitstringBit(list.RawBits, *targetIndex, bitVal); err != nil {
-			return err
-		}
-		signer, err := s.resolveActiveSigner(tx, issuerRec)
+		res, err := s.applyStatusTransitionTx(tx, cred, issuerRec, op, token.ClientID, in.ReasonCode, "", now)
 		if err != nil {
 			return err
 		}
-		list.Version++
-		list.ValidFrom = now
-		list.ValidUntil = now.Add(s.cfg.StatusListTTL)
-		list.UpdatedAt = now
-		signedList, err := IssueStatusListVC(signer, list.ListID, list.Purpose, list.RawBits, list.ValidFrom, list.ValidUntil)
-		if err != nil {
-			return err
-		}
-		list.PublishedVersion = list.Version
-		list.PublishedJWT = signedList
-
-		cred.DesiredStatus = nextStatus
-		cred.PublishedStatus = nextStatus
-		cred.StatusVersion++
-		if in.ReasonCode != "" {
-			cred.ReasonCode = in.ReasonCode
-		}
-		if err := tx.SaveStatusListAndCredential(list, cred); err != nil {
-			return err
-		}
-		result = StatusChangeResult{
-			CredentialID:      cred.CredentialID,
-			State:             "accepted",
-			DesiredStatus:     cred.DesiredStatus,
-			PublishedStatus:   cred.PublishedStatus,
-			StatusListVersion: list.PublishedVersion,
-			PropagationState:  "published",
-			EffectiveAt:       now,
-		}
-		if err := tx.SaveStatusIdempotency(StatusIdempotencyRecord{
+		result = res
+		return tx.SaveStatusIdempotency(StatusIdempotencyRecord{
 			ClientID: token.ClientID, KeyHash: keyHash, RequestHash: requestHash, Result: result,
-		}); err != nil {
-			return err
-		}
-		return tx.AppendAudit(s.newAudit(cred.TenantID, token.ClientID, auditAction, cred.CredentialID, "succeeded", "", now))
+		})
 	})
 	if err != nil {
 		return StatusChangeResult{}, false, err
 	}
 	return result, replay, nil
+}
+
+func (s *Service) applyStatusTransitionTx(tx Tx, cred IssuedCredentialRecord, issuerRec IssuerRecord, op, actorID, reasonCode, correlationID string, now time.Time) (StatusChangeResult, error) {
+	var targetListID string
+	var targetIndex *int
+	var bitVal bool
+	var nextStatus, auditAction string
+	switch op {
+	case "suspend":
+		if cred.DesiredStatus != CredentialStatusActive || cred.SuspensionListID == "" || cred.SuspensionIndex == nil {
+			return StatusChangeResult{}, ErrInvalidStatusTransition
+		}
+		targetListID, targetIndex, bitVal = cred.SuspensionListID, cred.SuspensionIndex, true
+		nextStatus, auditAction = CredentialStatusSuspended, "credential.suspended"
+		ts := now
+		cred.SuspendedAt = &ts
+	case "reactivate":
+		if cred.DesiredStatus != CredentialStatusSuspended || cred.SuspensionListID == "" || cred.SuspensionIndex == nil {
+			return StatusChangeResult{}, ErrInvalidStatusTransition
+		}
+		targetListID, targetIndex, bitVal = cred.SuspensionListID, cred.SuspensionIndex, false
+		nextStatus, auditAction = CredentialStatusActive, "credential.reactivated"
+		cred.SuspendedAt = nil
+	case "revoke":
+		if cred.DesiredStatus == CredentialStatusRevoked || cred.RevocationListID == "" || cred.RevocationIndex == nil {
+			return StatusChangeResult{}, ErrInvalidStatusTransition
+		}
+		targetListID, targetIndex, bitVal = cred.RevocationListID, cred.RevocationIndex, true
+		nextStatus, auditAction = CredentialStatusRevoked, "credential.revoked"
+		ts := now
+		cred.RevokedAt = &ts
+	default:
+		return StatusChangeResult{}, ErrInvalidRequest
+	}
+
+	list, found, err := tx.LockStatusList(cred.IssuerID, targetListID)
+	if err != nil || !found {
+		return StatusChangeResult{}, ErrResourceNotFound
+	}
+	if err := SetBitstringBit(list.RawBits, *targetIndex, bitVal); err != nil {
+		return StatusChangeResult{}, err
+	}
+	signer, err := s.resolveActiveSigner(tx, issuerRec)
+	if err != nil {
+		return StatusChangeResult{}, err
+	}
+	list.Version++
+	list.ValidFrom = now
+	list.ValidUntil = now.Add(s.cfg.StatusListTTL)
+	list.UpdatedAt = now
+	signedList, err := IssueStatusListVC(signer, list.ListID, list.Purpose, list.RawBits, list.ValidFrom, list.ValidUntil)
+	if err != nil {
+		return StatusChangeResult{}, err
+	}
+	list.PublishedVersion = list.Version
+	list.PublishedJWT = signedList
+
+	cred.DesiredStatus = nextStatus
+	cred.PublishedStatus = nextStatus
+	cred.StatusVersion++
+	if reasonCode != "" {
+		cred.ReasonCode = reasonCode
+	}
+	if err := tx.SaveStatusListAndCredential(list, cred); err != nil {
+		return StatusChangeResult{}, err
+	}
+	if err := tx.AppendAudit(s.newAudit(cred.TenantID, actorID, auditAction, cred.CredentialID, "succeeded", correlationID, now)); err != nil {
+		return StatusChangeResult{}, err
+	}
+	return StatusChangeResult{
+		CredentialID:      cred.CredentialID,
+		State:             "accepted",
+		DesiredStatus:     cred.DesiredStatus,
+		PublishedStatus:   cred.PublishedStatus,
+		StatusListVersion: list.PublishedVersion,
+		PropagationState:  "published",
+		EffectiveAt:       now,
+	}, nil
 }
 
 // ResolveStatusList returns the signed BitstringStatusListCredential JWT for

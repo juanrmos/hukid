@@ -140,6 +140,24 @@ export async function revokeClient(identity: Identity, clientId: string, signal:
     identity.csrfToken, undefined, { method: 'POST', key: idempotencyKey() });
 }
 
+export type CredentialStatusOperation = 'suspend' | 'reactivate' | 'revoke';
+export interface StatusChangeInput { reasonCode?: string; comment?: string }
+export interface StatusChangeResult {
+  credentialId: string; state: string; desiredStatus: string; publishedStatus: string;
+  statusListVersion: number; propagationState: string; effectiveAt: string;
+}
+
+export async function changeOperatorCredentialStatus(
+  identity: Identity, credentialId: string, operation: CredentialStatusOperation,
+  body: StatusChangeInput, signal: AbortSignal,
+): Promise<StatusChangeResult> {
+  const response = await request(
+    issuePath(identity, `credentials/${encodeURIComponent(credentialId)}/${operation}`),
+    signal, identity.csrfToken, body, { method: 'POST', key: idempotencyKey() },
+  );
+  return await response.json() as StatusChangeResult;
+}
+
 export function errorMessage(error: unknown): string {
   if (!(error instanceof AuthError)) return 'No se confirmó el resultado. Comprueba tu conexión y vuelve a cargar la sección.';
   if (error.code === 'step_up_required' || error.code === 'mfa_required') return 'Verifica tu identidad antes de continuar.';

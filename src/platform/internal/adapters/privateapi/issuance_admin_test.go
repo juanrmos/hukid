@@ -43,6 +43,8 @@ func (v *adminVerifierStub) VerifyInvitationOperator(_ context.Context, raw stri
 		return a.Operator{Issuer: "https://idp.hukid.test", Subject: "actor-admin"}, v.now.Add(-time.Second), nil
 	case "sec-tok":
 		return a.Operator{Issuer: "https://idp.hukid.test", Subject: "actor-sec"}, v.now.Add(5 * time.Minute), nil
+	case "issuer-op-tok":
+		return a.Operator{Issuer: "https://idp.hukid.test", Subject: "actor-op"}, v.now.Add(5 * time.Minute), nil
 	default:
 		return a.Operator{}, time.Time{}, a.ErrCredential
 	}
@@ -311,5 +313,195 @@ func TestIssuanceAdminLifecycleAuthStepUpETagAndAudit(t *testing.T) {
 	w = doAdminReq(mux, http.MethodGet, "/v1/operator/tenants/tenant-a/issuers", "issuer-op-tok", "", "", nil)
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), issuerID) {
 		t.Fatalf("issuer_operator scoped read failed: %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestIssuanceAdminCredentialStatusMetricsAndReplayDLQ(t *testing.T) {
+	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	claimsKey := make([]byte, 32)
+	_, _ = rand.Read(claimsKey)
+
+	keys := map[string]*ecdsa.PrivateKey{}
+	provisioner := func(_, _, kid string) (string, issuance.PublicJWK, error) {
+		priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			return "", issuance.PublicJWK{}, err
+		}
+		keys[kid] = priv
+		jwk, err := issuance.ExportPublicJWK(&priv.PublicKey, kid)
+		return "vault://transit/hukid-test-" + kid + "#v1", jwk, err
+	}
+
+	svc, err := issuance.NewService(issuance.ServiceConfig{
+		ClaimsKey:        claimsKey,
+		ClaimsKeyVersion: "adm-ops-v1",
+		Clients:          issuance.NewClientRegistry(nil),
+		Definitions:      issuance.NewDefinitionRegistry(nil),
+		KeyProvisioner:   provisioner,
+		Signers: func(_, _, issuerURI, kid, _ string, _ *ecdsa.PublicKey) (issuance.Signer, error) {
+			priv, ok := keys[kid]
+			if !ok {
+				return nil, issuance.ErrNoActiveKey
+			}
+			return issuance.NewMemorySigner(issuerURI, kid, priv, nil)
+		},
+		Now:    func() time.Time { return now },
+		Random: rand.Reader,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	issuerID := "22222222-2222-4222-8222-222222222222"
+	tenancySvc, err := tenancy.New(&adminTenancyStore{allowedIssuer: issuerID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := &adminVerifierStub{now: now}
+	admin := &IssuanceAdminHandler{
+		Operators: &Handler{Verifier: v, Tenancy: tenancySvc},
+		Verifier:  v,
+		Service:   svc,
+		Now:       func() time.Time { return now },
+	}
+	mux := http.NewServeMux()
+	admin.Register(mux)
+
+	w := doAdminReq(mux, http.MethodPost, "/v1/operator/tenants/tenant-a/issuers", "admin-tok", "idem-ops-issuer-01", "", map[string]any{
+		"issuerId": issuerID, "slug": "unas-ops", "displayName": "UNAS Ops", "initialKid": "ops-k1",
+	})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create issuer failed: %d %s", w.Code, w.Body.String())
+	}
+	w = doAdminReq(mux, http.MethodPost, "/v1/operator/tenants/tenant-a/issuers/"+issuerID+"/credential-definitions", "admin-tok", "idem-ops-def-001", "", map[string]any{
+		"id": "unas-certificate", "version": "1.0.0", "configurationId": "unas_ops_v1",
+		"displayName": "Certificado Ops", "locale": "es-PE",
+		"contexts": []string{issuance.CertificateContext}, "types": []string{issuance.CertificateType},
+		"defaultValiditySeconds": 31536000, "statusPurposes": []string{"revocation", "suspension"},
+		"fields": map[string]any{"participantName": map[string]any{"type": "string", "required": true}, "eventName": map[string]any{"type": "string", "required": true}},
+	})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create draft failed: %d %s", w.Code, w.Body.String())
+	}
+	w = doAdminReq(mux, http.MethodPost, "/v1/operator/tenants/tenant-a/issuers/"+issuerID+"/credential-definitions/unas-certificate/versions/1.0.0/publish", "admin-tok", "idem-ops-pub-001", "", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("publish def failed: %d %s", w.Code, w.Body.String())
+	}
+	w = doAdminReq(mux, http.MethodPost, "/v1/operator/tenants/tenant-a/clients", "admin-tok", "idem-ops-cli-001", "", map[string]any{
+		"clientName": "Events Ops", "allowedIssuers": []string{issuerID}, "scopes": []string{"issuance:create", "issuance:read", "status:write"},
+	})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("register client failed: %d %s", w.Code, w.Body.String())
+	}
+	var regResp struct {
+		Client       issuance.ClientSummary `json:"client"`
+		ClientSecret string                 `json:"clientSecret"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &regResp)
+
+	tokResp, err := svc.ClientCredentialsToken(regResp.Client.ClientID, regResp.ClientSecret, []string{issuance.ScopeIssuanceCreate, issuance.ScopeIssuanceRead})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intTok, _ := svc.AuthenticateIntegration(tokResp.AccessToken)
+
+	// Issue one immediate credential.
+	immReq, _, err := svc.CreateIssuanceRequest(intTok, "adm-imm-req-0001", issuance.IssuanceRequestInput{
+		IssuerID: issuerID, CredentialDefinition: "unas-certificate@1.0.0",
+		Claims: map[string]any{"participantName": "Ana Gomez", "eventName": "Cloud Day"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	offer, _ := svc.ResolveOffer("unas-ops", immReq.CredentialOfferURI[strings.LastIndex(immReq.CredentialOfferURI, "ofr_"):])
+	vciTok, _ := svc.PreAuthorizedToken(offer.Grants[issuance.PreAuthorizedGrantType].PreAuthorizedCode)
+	nonce, _ := svc.IssueNonce("unas-ops")
+	holder, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	proof, _ := issuance.BuildHolderProof(holder, issuance.IssuerPrefix+"unas-ops", nonce, now, nil)
+	if _, err := svc.RequestCredential("unas-ops", vciTok.AccessToken, issuance.CredentialRequest{
+		CredentialIdentifier: vciTok.AuthorizationDetails[0].CredentialIdentifiers[0],
+		Proofs: struct {
+			JWT []string `json:"jwt"`
+		}{JWT: []string{proof}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	polled, _ := svc.GetRequest(intTok, immReq.ID)
+	if polled.CredentialID == "" {
+		t.Fatalf("expected issued credential ID: %+v", polled)
+	}
+
+	// Create one failed deferred request (DLQ).
+	defReq, _, err := svc.CreateIssuanceRequest(intTok, "adm-def-req-0001", issuance.IssuanceRequestInput{
+		IssuerID: issuerID, CredentialDefinition: "unas-certificate@1.0.0",
+		Claims:   map[string]any{"participantName": "Marco Perez", "eventName": "Cloud Day"},
+		Delivery: &issuance.DeliveryInput{Deferred: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defOffer, _ := svc.ResolveOffer("unas-ops", defReq.CredentialOfferURI[strings.LastIndex(defReq.CredentialOfferURI, "ofr_"):])
+	defVciTok, _ := svc.PreAuthorizedToken(defOffer.Grants[issuance.PreAuthorizedGrantType].PreAuthorizedCode)
+	defNonce, _ := svc.IssueNonce("unas-ops")
+	defProof, _ := issuance.BuildHolderProof(holder, issuance.IssuerPrefix+"unas-ops", defNonce, now, nil)
+	if _, err := svc.RequestCredential("unas-ops", defVciTok.AccessToken, issuance.CredentialRequest{
+		CredentialIdentifier: defVciTok.AuthorizationDetails[0].CredentialIdentifiers[0],
+		Proofs: struct {
+			JWT []string `json:"jwt"`
+		}{JWT: []string{defProof}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.FailDeferredRequest("tenant-a", defReq.ID, "kms_down"); err != nil {
+		t.Fatal(err)
+	}
+
+	// issuer_operator cannot mutate credential status; tenant_admin with MFA can suspend -> reactivate -> revoke.
+	credBase := "/v1/operator/tenants/tenant-a/credentials/" + polled.CredentialID
+	w = doAdminReq(mux, http.MethodPost, credBase+"/suspend", "issuer-op-tok", "idem-susp-forbid-01", "", map[string]any{"reasonCode": "operator_request"})
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for issuer_operator suspend, got %d %s", w.Code, w.Body.String())
+	}
+	w = doAdminReq(mux, http.MethodPost, credBase+"/suspend", "admin-tok", "idem-susp-admin-001", "", map[string]any{"reasonCode": "operator_request", "comment": "revisión"})
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"desiredStatus":"suspended"`) {
+		t.Fatalf("suspend failed: %d %s", w.Code, w.Body.String())
+	}
+	w = doAdminReq(mux, http.MethodPost, credBase+"/reactivate", "admin-tok", "idem-react-admin-01", "", map[string]any{})
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"desiredStatus":"active"`) {
+		t.Fatalf("reactivate failed: %d %s", w.Code, w.Body.String())
+	}
+	w = doAdminReq(mux, http.MethodPost, credBase+"/revoke", "admin-tok", "idem-rev-admin-0001", "", map[string]any{"reasonCode": "security_response"})
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"desiredStatus":"revoked"`) {
+		t.Fatalf("revoke failed: %d %s", w.Code, w.Body.String())
+	}
+	w = doAdminReq(mux, http.MethodPost, credBase+"/reactivate", "admin-tok", "idem-react-admin-02", "", map[string]any{})
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 invalid_state_transition after revoke, got %d %s", w.Code, w.Body.String())
+	}
+
+	// Metrics and DLQ replay.
+	w = doAdminReq(mux, http.MethodGet, "/v1/operator/tenants/tenant-a/issuance-metrics", "admin-tok", "", "", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET issuance-metrics failed: %d %s", w.Code, w.Body.String())
+	}
+	var m issuance.OperationalMetrics
+	if err := json.Unmarshal(w.Body.Bytes(), &m); err != nil {
+		t.Fatal(err)
+	}
+	if m.RevokedCredentials != 1 || m.DeferredFailedDLQ != 1 || m.DeferredPending != 0 {
+		t.Fatalf("unexpected metrics before DLQ replay: %+v", m)
+	}
+
+	w = doAdminReq(mux, http.MethodPost, "/v1/operator/tenants/tenant-a/issuance-requests/"+defReq.ID+"/replay-dlq", "admin-tok", "idem-replay-dlq-001", "", nil)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"requeued":true`) {
+		t.Fatalf("replay-dlq failed: %d %s", w.Code, w.Body.String())
+	}
+	w = doAdminReq(mux, http.MethodGet, "/v1/operator/tenants/tenant-a/issuance-metrics", "admin-tok", "", "", nil)
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Code)
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &m)
+	if m.DeferredPending != 1 || m.DeferredFailedDLQ != 0 {
+		t.Fatalf("unexpected metrics after DLQ replay: %+v", m)
 	}
 }

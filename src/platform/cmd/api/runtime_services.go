@@ -31,6 +31,7 @@ import (
 const (
 	envIssuanceDatabaseURL         = "HUKID_ISSUANCE_DATABASE_URL"
 	envIssuanceAuthServer          = "HUKID_ISSUANCE_AUTH_SERVER"
+	envIssuancePublicURL           = "HUKID_ISSUANCE_PUBLIC_URL"
 	envIssuanceClaimsKey           = "HUKID_ISSUANCE_CLAIMS_KEY"
 	envIssuanceClaimsKeyCiphertext = "HUKID_ISSUANCE_CLAIMS_KEY_CIPHERTEXT"
 	envIssuanceClaimsKeyVersion    = "HUKID_ISSUANCE_CLAIMS_KEY_VERSION"
@@ -55,6 +56,7 @@ type issuanceRuntimeConfig struct {
 	Environment         string
 	DatabaseURL         string
 	AuthServer          string
+	PublicURL           string
 	ClaimsKey           []byte
 	ClaimsKeyCiphertext string
 	ClaimsKeyVersion    string
@@ -81,7 +83,7 @@ func isProdOrStaging(env string) bool {
 
 func anyIssuanceRuntimeEnvSet() bool {
 	for _, k := range []string{
-		envIssuanceDatabaseURL, envIssuanceAuthServer, envIssuanceClaimsKey,
+		envIssuanceDatabaseURL, envIssuanceAuthServer, envIssuancePublicURL, envIssuanceClaimsKey,
 		envIssuanceClaimsKeyCiphertext, envIssuanceClaimsKeyVersion,
 		envVaultAddr, envVaultToken, envVaultMount, envVaultNamespace, envVaultKEKName,
 	} {
@@ -150,6 +152,16 @@ func loadIssuanceRuntimeConfig() (*issuanceRuntimeConfig, error) {
 	if u.Scheme != "https" && (isProdOrStaging(env) || !isLoopbackHTTPURL(u)) {
 		return nil, errIssuanceRuntimeConfig
 	}
+	publicURL := strings.TrimSpace(os.Getenv(envIssuancePublicURL))
+	if publicURL != "" {
+		pu, puErr := url.Parse(publicURL)
+		if puErr != nil || pu.Host == "" || pu.User != nil || pu.RawQuery != "" || pu.Fragment != "" {
+			return nil, errIssuanceRuntimeConfig
+		}
+		if pu.Scheme != "https" && (isProdOrStaging(env) || !isLoopbackHTTPURL(pu)) {
+			return nil, errIssuanceRuntimeConfig
+		}
+	}
 
 	keyVer := strings.TrimSpace(os.Getenv(envIssuanceClaimsKeyVersion))
 	if keyVer == "" || len(keyVer) > 128 || strings.ContainsAny(keyVer, " \t\r\n") {
@@ -201,6 +213,7 @@ func loadIssuanceRuntimeConfig() (*issuanceRuntimeConfig, error) {
 		Environment:         env,
 		DatabaseURL:         dsn,
 		AuthServer:          strings.TrimRight(authServer, "/"),
+		PublicURL:           publicURL,
 		ClaimsKey:           plainKey,
 		ClaimsKeyCiphertext: wrappedKey,
 		ClaimsKeyVersion:    keyVer,
@@ -229,6 +242,9 @@ func configureIssuanceRuntime(
 		return nil, nil, err
 	}
 	defer clear(cfg.ClaimsKey)
+	if err := issuance.SetIssuerPrefix(cfg.PublicURL); err != nil {
+		return nil, nil, errIssuanceRuntimeConfig
+	}
 	if now == nil {
 		now = time.Now
 	}

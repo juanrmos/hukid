@@ -25,6 +25,9 @@ func run() error {
 	if len(os.Args) > 1 && os.Args[1] == "deferred" {
 		return runDeferredWorker(os.Args[2:])
 	}
+	if len(os.Args) > 1 && os.Args[1] == "retention" {
+		return runRetentionWorker(os.Args[2:])
+	}
 	invalid := errors.New("isolated invitation worker configuration required")
 	if len(os.Args) != 3 || !authentication.SupportedEnvironment(os.Getenv("HUKID_ENV")) {
 		return invalid

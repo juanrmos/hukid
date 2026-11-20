@@ -2,14 +2,15 @@ import { useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import type { Identity } from '../authentication/client';
 import { date as formatDate } from '../user-management/client';
-import type { Client, Definition, DefinitionInput, FieldSpec, Issuer, OperatorCredential, OperatorRequest } from './client';
-import { compromiseIssuerKey, createDefinition, createIssuer, errorMessage, getDefinition,
+import type { Client, CredentialStatusOperation, Definition, DefinitionInput, FieldSpec, Issuer, OperatorCredential, OperatorRequest } from './client';
+import { changeOperatorCredentialStatus, compromiseIssuerKey, createDefinition, createIssuer, errorMessage, getDefinition,
   listClients, listDefinitions, listIssuers, publishDefinition, registerClient, replaceDefinition,
   revokeClient, rotateClientSecret, rotateIssuerKey, retireDefinition, listOperatorRequests, listOperatorCredentials } from './client';
 import './styles.css';
 
 type Kind = 'emisores' | 'definiciones' | 'clientes' | 'solicitudes' | 'credenciales';
 type Action = { issuerId: string; operation: 'rotate' | 'compromise' } | null;
+type CredentialAction = { credentialId: string; operation: CredentialStatusOperation } | null;
 type EditDraft = { item: Definition; etag: string } | null;
 const splitList = (value: string) => value.split(',').map(part => part.trim()).filter(Boolean);
 const blankDefinition: DefinitionInput = { id: '', version: '1.0.0', configurationId: '', displayName: '', locale: 'es-PE',
@@ -29,6 +30,9 @@ export function IssuanceManagement({ identity, kind }: { identity: Identity; kin
   const [offset, setOffset] = useState(0);
   const [creating, setCreating] = useState(false);
   const [action, setAction] = useState<Action>(null);
+  const [credentialAction, setCredentialAction] = useState<CredentialAction>(null);
+  const [statusReason, setStatusReason] = useState('operator_request');
+  const [statusComment, setStatusComment] = useState('');
   const [keyID, setKeyID] = useState('');
   const [editing, setEditing] = useState<EditDraft>(null);
   const [definitionForm, setDefinitionForm] = useState<DefinitionInput>(blankDefinition);
@@ -48,6 +52,7 @@ export function IssuanceManagement({ identity, kind }: { identity: Identity; kin
   const canManage = kind === 'emisores' ? capabilities.includes('issuers:manage') :
     kind === 'definiciones' ? capabilities.includes('definitions:manage') :
     kind === 'clientes' && capabilities.includes('clients:manage');
+  const canManageCredentials = kind === 'credenciales' && capabilities.includes('issuers:manage');
 
   useEffect(() => {
     const dialog = secretDialog.current;
@@ -81,7 +86,8 @@ export function IssuanceManagement({ identity, kind }: { identity: Identity; kin
   }, [identity.activeTenantId, kind, selectedIssuer, refresh, canRead, offset]);
 
   function changed(message: string) {
-    setNotice(message); setError(''); setCreating(false); setAction(null); setEditing(null); setSecret('');
+    setNotice(message); setError(''); setCreating(false); setAction(null); setCredentialAction(null); setEditing(null); setSecret('');
+    setStatusReason('operator_request'); setStatusComment('');
     setRefresh(value => value + 1);
   }
 
@@ -191,6 +197,24 @@ export function IssuanceManagement({ identity, kind }: { identity: Identity; kin
 
   function beginEdit(item: Definition) { void editDefinition(item); }
   function closeSecret() { setSecret(''); }
+
+  async function submitCredentialStatus(event: FormEvent) {
+    event.preventDefault();
+    if (!credentialAction) return;
+    setBusy(true); setError('');
+    try {
+      const comment = statusComment.trim();
+      const body = credentialAction.operation === 'reactivate'
+        ? (comment ? { comment } : {})
+        : { reasonCode: statusReason, ...(comment ? { comment } : {}) };
+      const res = await changeOperatorCredentialStatus(
+        identity, credentialAction.credentialId, credentialAction.operation, body, AbortSignal.timeout(12000),
+      );
+      const verb = credentialAction.operation === 'suspend' ? 'suspendida' : credentialAction.operation === 'reactivate' ? 'reactivada' : 'revocada definitivamente';
+      changed(`Credencial ${verb}. Estado publicado: ${res.publishedStatus} (v${res.statusListVersion}).`);
+    } catch (cause) { setError(errorMessage(cause)); }
+    finally { setBusy(false); }
+  }
 
   if (!canRead) return <section className="issuance"><p role="status" className="issuance-feedback">No tienes permiso para consultar esta sección. Contacta con el administrador si necesitas acceso.</p></section>;
 
@@ -323,13 +347,38 @@ export function IssuanceManagement({ identity, kind }: { identity: Identity; kin
       {busy && <p className="issuance-feedback" role="status">Cargando credenciales…</p>}
       {!busy && !credentials.length && <p className="issuance-feedback">No hay credenciales emitidas.</p>}
       {!!credentials.length && <div className="issuance-table-wrap"><table className="issuance-table"><caption className="sr-only">Credenciales emitidas</caption>
-        <thead><tr><th>Credencial</th><th>Solicitud</th><th>Estado administrativo</th><th>Publicado</th><th>Versión de status</th><th>Emitida</th></tr></thead>
+        <thead><tr><th>Credencial</th><th>Solicitud</th><th>Estado administrativo</th><th>Publicado</th><th>Versión de status</th><th>Emitida</th>{canManageCredentials && <th>Acciones</th>}</tr></thead>
         <tbody>{credentials.map(item => <tr key={item.credentialId}><td><b>{item.credentialId}</b><span className="issuance-sub">{item.issuerId}</span></td>
-          <td>{item.requestId}</td><td>{item.desiredStatus}</td><td>{item.publishedStatus}</td><td>{item.statusVersion}</td><td>{formatDate(item.issuedAt)}</td></tr>)}</tbody></table></div>}
+          <td>{item.requestId}</td><td><span className="issuance-state">{item.desiredStatus}</span></td><td>{item.publishedStatus}</td><td>{item.statusVersion}</td><td>{formatDate(item.issuedAt)}</td>
+          {canManageCredentials && <td className="issuance-actions">
+            {item.desiredStatus === 'active' && <button disabled={busy} onClick={() => { setCredentialAction({ credentialId: item.credentialId, operation: 'suspend' }); setStatusReason('operator_request'); setStatusComment(''); }}>Suspender</button>}
+            {item.desiredStatus === 'suspended' && <button className="issuance-primary" disabled={busy} onClick={() => { setCredentialAction({ credentialId: item.credentialId, operation: 'reactivate' }); setStatusComment(''); }}>Reactivar</button>}
+            {item.desiredStatus !== 'revoked' && <button className="issuance-danger" disabled={busy} onClick={() => { setCredentialAction({ credentialId: item.credentialId, operation: 'revoke' }); setStatusReason('operator_request'); setStatusComment(''); }}>Revocar</button>}
+          </td>}</tr>)}</tbody></table></div>}
+      {credentialAction && canManageCredentials && <form className="issuance-form compact" onSubmit={submitCredentialStatus}>
+        <h2>{credentialAction.operation === 'suspend' ? 'Suspender credencial' : credentialAction.operation === 'reactivate' ? 'Reactivar credencial' : 'Revocar credencial definitivamente'}</h2>
+        <p>{credentialAction.operation === 'revoke'
+          ? `La credencial ${credentialAction.credentialId} quedará revocada de forma irreversible y se publicará en la Status List.`
+          : `Se actualizará el estado de ${credentialAction.credentialId} en la Bitstring Status List.`}</p>
+        {credentialAction.operation !== 'reactivate' && <label>Motivo<select value={statusReason} onChange={event => setStatusReason(event.target.value)}>
+          <option value="operator_request">Solicitud operativa (operator_request)</option>
+          <option value="security_response">Respuesta de seguridad (security_response)</option>
+          <option value="holder_request">Solicitud del titular (holder_request)</option>
+          <option value="data_correction">Corrección de datos (data_correction)</option>
+        </select></label>}
+        <label>Comentario (opcional)<input maxLength={512} value={statusComment} onChange={event => setStatusComment(event.target.value)} /></label>
+        <div className="issuance-actions">
+          <button className={credentialAction.operation === 'revoke' ? 'issuance-danger' : 'issuance-primary'} disabled={busy}>
+            {credentialAction.operation === 'suspend' ? 'Confirmar suspensión' : credentialAction.operation === 'reactivate' ? 'Confirmar reactivación' : 'Confirmar revocación'}</button>
+          <button type="button" disabled={busy} onClick={() => setCredentialAction(null)}>Cancelar</button>
+        </div>
+      </form>}
       <div className="issuance-toolbar"><button disabled={busy || offset === 0} onClick={() => setOffset(Math.max(0, offset - 50))}>Anterior</button>
         <span>Resultados {offset + (credentials.length ? 1 : 0)}–{offset + credentials.length}</span>
         <button disabled={busy || credentials.length < 50} onClick={() => setOffset(offset + 50)}>Siguiente</button></div>
-      <p className="issuance-sub">Las acciones administrativas de status siguen pendientes de política de autorización del owner.</p>
+      <p className="issuance-sub">{canManageCredentials
+        ? 'Los cambios de estado requieren verificación reciente de identidad (MFA) y actualizan la Bitstring Status List.'
+        : 'Solo los administradores con permiso de gestión de emisores y MFA reciente pueden suspender, reactivar o revocar credenciales.'}</p>
     </>}
 
     {!!secret && <dialog ref={secretDialog} className="issuance-secret" aria-labelledby="issuance-secret-title"

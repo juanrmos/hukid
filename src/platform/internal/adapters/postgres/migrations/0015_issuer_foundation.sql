@@ -15,7 +15,7 @@ CREATE TABLE tenancy.issuers (
   issuer_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id uuid NOT NULL REFERENCES tenancy.tenants(tenant_id),
   slug text NOT NULL UNIQUE CHECK (slug ~ '^[a-z0-9][a-z0-9_-]{0,62}[a-z0-9]$|^[a-z0-9]$'),
-  issuer_uri text NOT NULL UNIQUE CHECK (issuer_uri = 'https://issuer.hukid.pe/' || slug),
+  issuer_uri text NOT NULL UNIQUE CHECK (issuer_uri ~ '^https?://[^/?#]+/.+' AND right(issuer_uri, length(slug) + 1) = '/' || slug),
   display_name text NOT NULL CHECK (length(display_name) BETWEEN 1 AND 200),
   state text NOT NULL DEFAULT 'active' CHECK (state IN ('active', 'suspended')),
   revision bigint NOT NULL DEFAULT 1 CHECK (revision > 0),

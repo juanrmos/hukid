@@ -170,7 +170,8 @@ async function start() {
   if (process.env.HUKID_VAULT_ADDR && process.env.HUKID_VAULT_TOKEN) {
     Object.assign(env, {
       HUKID_ISSUANCE_DATABASE_URL: dsn(s.roles.issuance.login, s.roles.issuance.pw),
-      HUKID_ISSUANCE_AUTH_SERVER: `http://127.0.0.1:${API_PORT}`,
+      HUKID_ISSUANCE_AUTH_SERVER: process.env.HUKID_ISSUANCE_AUTH_SERVER || `http://127.0.0.1:${API_PORT}`,
+      ...(process.env.HUKID_ISSUANCE_PUBLIC_URL ? { HUKID_ISSUANCE_PUBLIC_URL: process.env.HUKID_ISSUANCE_PUBLIC_URL } : {}),
       HUKID_ISSUANCE_CLAIMS_KEY: s.issuanceClaimsKey,
       HUKID_ISSUANCE_CLAIMS_KEY_VERSION: 'local-1',
       HUKID_VAULT_ADDR: process.env.HUKID_VAULT_ADDR,

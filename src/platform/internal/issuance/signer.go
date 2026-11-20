@@ -25,9 +25,31 @@ import (
 )
 
 const (
-	// IssuerPrefix is the canonical base URL for HukID v0 logical issuers (profile 3.2).
-	IssuerPrefix = "https://issuer.hukid.pe/"
+	// DefaultIssuerPrefix is the canonical base URL for HukID v0 logical issuers (profile 3.2).
+	DefaultIssuerPrefix = "https://issuer.hukid.pe/"
 )
+
+// IssuerPrefix is the active base URL prefix for logical issuers; defaults to DefaultIssuerPrefix
+// and can be overridden in non-production environments (e.g. HTTPS tunnels) via SetIssuerPrefix.
+var IssuerPrefix = DefaultIssuerPrefix
+
+// SetIssuerPrefix updates IssuerPrefix to rawBaseURL (or resets to DefaultIssuerPrefix if empty).
+func SetIssuerPrefix(rawBaseURL string) error {
+	trimmed := strings.TrimSpace(rawBaseURL)
+	if trimmed == "" {
+		IssuerPrefix = DefaultIssuerPrefix
+		return nil
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return ErrInvalidIssuerConfig
+	}
+	if parsed.Scheme != "https" && parsed.Scheme != "http" {
+		return ErrInvalidIssuerConfig
+	}
+	IssuerPrefix = strings.TrimRight(parsed.String(), "/") + "/"
+	return nil
+}
 
 var (
 	// ErrInvalidIssuerConfig reports invalid issuer URI, kid or P-256 key configuration.
@@ -77,14 +99,18 @@ type MemorySigner struct {
 	random io.Reader
 }
 
-// ValidateIssuerIdentifier enforces https://issuer.hukid.pe/{slug} with a single
+// ValidateIssuerIdentifier enforces <IssuerPrefix>{slug} with a single
 // lowercase slug segment and no query, fragment or userinfo (profile section 3.2).
 func ValidateIssuerIdentifier(issuer string) error {
 	if !strings.HasPrefix(issuer, IssuerPrefix) {
 		return ErrInvalidIssuerConfig
 	}
+	prefixURL, err := url.Parse(IssuerPrefix)
+	if err != nil || prefixURL.Host == "" || (prefixURL.Scheme != "https" && prefixURL.Scheme != "http") {
+		return ErrInvalidIssuerConfig
+	}
 	parsed, err := url.Parse(issuer)
-	if err != nil || parsed.Scheme != "https" || parsed.Host != "issuer.hukid.pe" ||
+	if err != nil || parsed.Scheme != prefixURL.Scheme || parsed.Host != prefixURL.Host ||
 		parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return ErrInvalidIssuerConfig
 	}

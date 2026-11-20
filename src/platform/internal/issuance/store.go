@@ -196,6 +196,9 @@ type Tx interface {
 	SaveStatusIdempotency(rec StatusIdempotencyRecord) error
 	AppendAudit(rec AuditRecord) error
 	ListAuditEvents(actionFilter string) ([]AuditRecord, error)
+	PurgeExpiredIssuanceMaterial(now, cutoff time.Time, limit int) (RetentionSummary, error)
+	ReadOperationalMetrics() (OperationalMetrics, error)
+	RequeueFailedDeferredRequest(requestID string, newExpiresAt time.Time) (bool, error)
 }
 
 type activeSignerProvider interface {
@@ -1096,4 +1099,97 @@ func (t *memoryTx) AppendAudit(rec AuditRecord) error {
 
 func (t *memoryTx) ListAuditEvents(actionFilter string) ([]AuditRecord, error) {
 	return t.m.audit.ListByTenant(t.tenantID, actionFilter), nil
+}
+
+func (t *memoryTx) PurgeExpiredIssuanceMaterial(now, cutoff time.Time, limit int) (RetentionSummary, error) {
+	var summary RetentionSummary
+	for _, req := range t.m.reqs {
+		if req.TenantID != t.tenantID {
+			continue
+		}
+		if req.OfferState == "ready" && !req.ExpiresAt.After(now) && summary.ExpiredOffers < limit {
+			req.OfferState = "expired"
+			req.OfferCipher = nil
+			req.OfferNonce = nil
+			req.OfferKeyVer = ""
+			summary.ExpiredOffers++
+		}
+		terminal := req.IssuanceState == "issued" || req.IssuanceState == "cancelled" || req.IssuanceState == "failed" || req.OfferState == "expired"
+		if terminal && !req.CreatedAt.After(cutoff) && req.ClaimsKeyVer != "shredded" && summary.ShreddedRequests < limit {
+			req.ClaimsCipher = make([]byte, 16)
+			req.ClaimsNonce = make([]byte, 12)
+			req.ClaimsKeyVer = "shredded"
+			req.SourceReference = ""
+			summary.ShreddedRequests++
+		}
+	}
+	for _, rec := range t.m.deferredByReq {
+		if rec.TenantID != t.tenantID || rec.Status != "issued" || rec.CompletedAt == nil || rec.CompletedAt.After(cutoff) {
+			continue
+		}
+		if len(rec.VCCipher) > 0 && summary.ShreddedDeferredVCs < limit {
+			rec.VCCipher = nil
+			rec.VCNonce = nil
+			rec.VCKeyVer = ""
+			summary.ShreddedDeferredVCs++
+		}
+	}
+	return summary, nil
+}
+
+func (t *memoryTx) ReadOperationalMetrics() (OperationalMetrics, error) {
+	var out OperationalMetrics
+	for _, entry := range t.m.byID {
+		if entry.record.TenantID == t.tenantID {
+			if entry.record.State == IssuerActive {
+				out.ActiveIssuers++
+			}
+			out.PublishedDefinitions += len(t.m.defs.ListPublished(t.tenantID, entry.record.IssuerID))
+		}
+	}
+	for _, req := range t.m.reqs {
+		if req.TenantID != t.tenantID {
+			continue
+		}
+		switch req.IssuanceState {
+		case "prepared":
+			out.PreparedRequests++
+		case "deferred":
+			out.DeferredPending++
+		case "failed":
+			out.DeferredFailedDLQ++
+		}
+	}
+	for _, cred := range t.m.issuedCreds {
+		if cred.TenantID != t.tenantID {
+			continue
+		}
+		switch cred.DesiredStatus {
+		case CredentialStatusActive:
+			out.IssuedCredentials++
+		case CredentialStatusSuspended:
+			out.SuspendedCredentials++
+		case CredentialStatusRevoked:
+			out.RevokedCredentials++
+		}
+	}
+	return out, nil
+}
+
+func (t *memoryTx) RequeueFailedDeferredRequest(requestID string, newExpiresAt time.Time) (bool, error) {
+	req, ok := t.m.reqs[requestID]
+	if !ok || req.TenantID != t.tenantID || !req.Deferred || req.IssuanceState != "failed" {
+		return false, nil
+	}
+	txRec, ok := t.m.deferredByReq[requestID]
+	if !ok || txRec.TenantID != t.tenantID || txRec.Status != "failed" {
+		return false, nil
+	}
+	req.IssuanceState = "deferred"
+	txRec.Status = "pending"
+	txRec.ErrorCode = ""
+	if newExpiresAt.After(txRec.ExpiresAt) {
+		txRec.ExpiresAt = newExpiresAt
+	}
+	return true, nil
 }

@@ -128,6 +128,102 @@ func runDeferredScheduler(ctx context.Context, interval time.Duration, step func
 	}
 }
 
+// openIssuanceWorkerRuntime validates the isolated issuance worker environment and
+// opens a tenant-RLS PostgreSQL pool and issuance.Service backed by Vault KMS.
+func openIssuanceWorkerRuntime(ctx context.Context) (*pgxpool.Pool, *issuance.Service, error) {
+	if !isDeferredRuntimeEnv(os.Getenv("HUKID_ENV")) {
+		return nil, nil, errDeferredWorkerConfig
+	}
+	env := os.Getenv("HUKID_ENV")
+	dsn := os.Getenv("HUKID_ISSUANCE_DATABASE_URL")
+	if isDeferredProdOrStaging(env) {
+		cfg, parseErr := pgxpool.ParseConfig(dsn)
+		if parseErr != nil || cfg.ConnConfig.Host == "" || cfg.ConnConfig.Database == "" || cfg.ConnConfig.TLSConfig == nil {
+			return nil, nil, errDeferredWorkerConfig
+		}
+	} else if postgres.ValidateLoginDatabase(dsn) != nil {
+		return nil, nil, errDeferredWorkerConfig
+	}
+
+	authServer := strings.TrimRight(os.Getenv("HUKID_ISSUANCE_AUTH_SERVER"), "/")
+	authURL, err := url.Parse(authServer)
+	if err != nil || authURL.Host == "" || authURL.User != nil || authURL.RawQuery != "" || authURL.Fragment != "" || authURL.Scheme != "https" && (isDeferredProdOrStaging(env) || !isDeferredLoopbackHTTPURL(authURL)) {
+		return nil, nil, errDeferredWorkerConfig
+	}
+	keyVersion := strings.TrimSpace(os.Getenv("HUKID_ISSUANCE_CLAIMS_KEY_VERSION"))
+	if keyVersion == "" || len(keyVersion) > 128 || strings.ContainsAny(keyVersion, " \t\r\n") {
+		return nil, nil, errDeferredWorkerConfig
+	}
+	var claimsKey []byte
+	if raw := os.Getenv("HUKID_ISSUANCE_CLAIMS_KEY"); raw != "" {
+		if os.Getenv("HUKID_ISSUANCE_CLAIMS_KEY_CIPHERTEXT") != "" {
+			return nil, nil, errDeferredWorkerConfig
+		}
+		claimsKey, err = base64.StdEncoding.Strict().DecodeString(raw)
+		if err != nil || len(claimsKey) != 32 {
+			clear(claimsKey)
+			return nil, nil, errDeferredWorkerConfig
+		}
+	} else if os.Getenv("HUKID_ISSUANCE_CLAIMS_KEY_CIPHERTEXT") == "" {
+		return nil, nil, errDeferredWorkerConfig
+	}
+	defer clear(claimsKey)
+
+	vaultCfg := vaultkms.Config{
+		BaseURL:   os.Getenv("HUKID_VAULT_ADDR"),
+		Token:     os.Getenv("HUKID_VAULT_TOKEN"),
+		MountPath: os.Getenv("HUKID_VAULT_MOUNT"),
+		Namespace: os.Getenv("HUKID_VAULT_NAMESPACE"),
+	}
+	if isDeferredProdOrStaging(env) {
+		vaultURL, parseErr := url.Parse(vaultCfg.BaseURL)
+		if parseErr != nil || vaultURL.Scheme != "https" || vaultURL.Host == "" || vaultURL.User != nil {
+			return nil, nil, errDeferredWorkerConfig
+		}
+	}
+	vault, err := vaultkms.NewClient(vaultCfg)
+	if err != nil {
+		return nil, nil, errDeferredWorkerConfig
+	}
+	if len(claimsKey) == 0 {
+		kek := strings.TrimSpace(os.Getenv("HUKID_VAULT_KEK_NAME"))
+		ciphertext := os.Getenv("HUKID_ISSUANCE_CLAIMS_KEY_CIPHERTEXT")
+		if kek == "" || !strings.HasPrefix(ciphertext, "vault:v") {
+			return nil, nil, errDeferredWorkerConfig
+		}
+		unwrapCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		claimsKey, err = vault.UnwrapDEK(unwrapCtx, kek, ciphertext, "hukid/claims-dek/v1|"+keyVersion)
+		cancel()
+		if err != nil || len(claimsKey) != 32 {
+			clear(claimsKey)
+			return nil, nil, errDeferredWorkerConfig
+		}
+		defer clear(claimsKey)
+	}
+
+	poolCtx, poolCancel := context.WithTimeout(ctx, 15*time.Second)
+	pool, err := postgres.OpenRuntimePool(poolCtx, dsn, "hukid_issuance_runtime", 4)
+	poolCancel()
+	if err != nil {
+		return nil, nil, errDeferredWorkerConfig
+	}
+	backend, err := postgres.NewIssuanceBackend(pool)
+	if err != nil {
+		pool.Close()
+		return nil, nil, errDeferredWorkerConfig
+	}
+	service, err := issuance.NewService(issuance.ServiceConfig{
+		ClaimsKey: claimsKey, ClaimsKeyVersion: keyVersion, Backend: backend,
+		Signers: vault.Resolver(), KeyProvisioner: vault.KeyProvisioner(),
+		AuthorizationServer: authServer,
+	})
+	if err != nil {
+		pool.Close()
+		return nil, nil, errDeferredWorkerConfig
+	}
+	return pool, service, nil
+}
+
 // runDeferredWorker is a bounded tenant-scoped batch intended for a scheduler or HA loop.
 // Invoke once with `worker deferred <tenant-id> [limit]` or periodically with `--interval=<dur>`.
 func runDeferredWorker(args []string) error {
@@ -144,95 +240,16 @@ func runDeferredWorker(args []string) error {
 			opts.interval = parsed
 		}
 	}
-	env := os.Getenv("HUKID_ENV")
-	dsn := os.Getenv("HUKID_ISSUANCE_DATABASE_URL")
-	if isDeferredProdOrStaging(env) {
-		cfg, parseErr := pgxpool.ParseConfig(dsn)
-		if parseErr != nil || cfg.ConnConfig.Host == "" || cfg.ConnConfig.Database == "" || cfg.ConnConfig.TLSConfig == nil {
-			return errDeferredWorkerConfig
-		}
-	} else if postgres.ValidateLoginDatabase(dsn) != nil {
-		return errDeferredWorkerConfig
-	}
-
-	authServer := strings.TrimRight(os.Getenv("HUKID_ISSUANCE_AUTH_SERVER"), "/")
-	authURL, err := url.Parse(authServer)
-	if err != nil || authURL.Host == "" || authURL.User != nil || authURL.RawQuery != "" || authURL.Fragment != "" || authURL.Scheme != "https" && (isDeferredProdOrStaging(env) || !isDeferredLoopbackHTTPURL(authURL)) {
-		return errDeferredWorkerConfig
-	}
-	keyVersion := strings.TrimSpace(os.Getenv("HUKID_ISSUANCE_CLAIMS_KEY_VERSION"))
-	if keyVersion == "" || len(keyVersion) > 128 || strings.ContainsAny(keyVersion, " \t\r\n") {
-		return errDeferredWorkerConfig
-	}
-	var claimsKey []byte
-	if raw := os.Getenv("HUKID_ISSUANCE_CLAIMS_KEY"); raw != "" {
-		if os.Getenv("HUKID_ISSUANCE_CLAIMS_KEY_CIPHERTEXT") != "" {
-			return errDeferredWorkerConfig
-		}
-		claimsKey, err = base64.StdEncoding.Strict().DecodeString(raw)
-		if err != nil || len(claimsKey) != 32 {
-			clear(claimsKey)
-			return errDeferredWorkerConfig
-		}
-	} else if os.Getenv("HUKID_ISSUANCE_CLAIMS_KEY_CIPHERTEXT") == "" {
-		return errDeferredWorkerConfig
-	}
-	defer clear(claimsKey)
-
-	vaultCfg := vaultkms.Config{
-		BaseURL:   os.Getenv("HUKID_VAULT_ADDR"),
-		Token:     os.Getenv("HUKID_VAULT_TOKEN"),
-		MountPath: os.Getenv("HUKID_VAULT_MOUNT"),
-		Namespace: os.Getenv("HUKID_VAULT_NAMESPACE"),
-	}
-	if isDeferredProdOrStaging(env) {
-		vaultURL, parseErr := url.Parse(vaultCfg.BaseURL)
-		if parseErr != nil || vaultURL.Scheme != "https" || vaultURL.Host == "" || vaultURL.User != nil {
-			return errDeferredWorkerConfig
-		}
-	}
-	vault, err := vaultkms.NewClient(vaultCfg)
-	if err != nil {
-		return errDeferredWorkerConfig
-	}
-	if len(claimsKey) == 0 {
-		kek := strings.TrimSpace(os.Getenv("HUKID_VAULT_KEK_NAME"))
-		ciphertext := os.Getenv("HUKID_ISSUANCE_CLAIMS_KEY_CIPHERTEXT")
-		if kek == "" || !strings.HasPrefix(ciphertext, "vault:v") {
-			return errDeferredWorkerConfig
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		claimsKey, err = vault.UnwrapDEK(ctx, kek, ciphertext, "hukid/claims-dek/v1|"+keyVersion)
-		cancel()
-		if err != nil || len(claimsKey) != 32 {
-			clear(claimsKey)
-			return errDeferredWorkerConfig
-		}
-		defer clear(claimsKey)
-	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	poolCtx, poolCancel := context.WithTimeout(ctx, 15*time.Second)
-	pool, err := postgres.OpenRuntimePool(poolCtx, dsn, "hukid_issuance_runtime", 4)
-	poolCancel()
+	pool, service, err := openIssuanceWorkerRuntime(ctx)
 	if err != nil {
-		return errDeferredWorkerConfig
+		return err
 	}
 	defer pool.Close()
-	backend, err := postgres.NewIssuanceBackend(pool)
-	if err != nil {
-		return errDeferredWorkerConfig
-	}
-	service, err := issuance.NewService(issuance.ServiceConfig{
-		ClaimsKey: claimsKey, ClaimsKeyVersion: keyVersion, Backend: backend,
-		Signers: vault.Resolver(), KeyProvisioner: vault.KeyProvisioner(),
-		AuthorizationServer: authServer,
-	})
-	if err != nil {
-		return errDeferredWorkerConfig
-	}
+
 	return runDeferredScheduler(ctx, opts.interval, func(tickCtx context.Context) error {
 		batchCtx, batchCancel := context.WithTimeout(tickCtx, 2*time.Minute)
 		defer batchCancel()

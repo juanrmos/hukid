@@ -1087,3 +1087,177 @@ func TestIssuanceBackendAdminAPIsAndTenantIsolation(t *testing.T) {
 	}
 	assertCleared(t, pool)
 }
+
+func TestIssuanceBackendRetentionMetricsAndReplayDLQ(t *testing.T) {
+	db := newTestDatabase(t)
+	mustMigrate(t, db)
+	mustBootstrap(t, db)
+
+	now := time.Date(2026, 11, 18, 15, 0, 0, 0, time.UTC)
+	clk := func() time.Time { return now }
+	pool := db.poolWithConns(t, "hukid_issuance_runtime", 4)
+	backend, err := NewIssuanceBackend(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	issuerID := "66666666-6666-4666-8666-666666666666"
+	clientID := "77777777-7777-4777-8777-777777777777"
+	secret := "pg-ops-client-secret-0123456789abcdef"
+	if _, err := backend.CreateIssuer(testContext, TestTenantA, issuerID, "unas-ops-pg", "UNAS Ops PG", now); err != nil {
+		t.Fatal(err)
+	}
+	k1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	k1JWK, _ := issuance.ExportPublicJWK(&k1.PublicKey, "pg-ops-k1")
+	if err := backend.RegisterKey(testContext, TestTenantA, issuerID, "pg-ops-k1", "kms://ops1", k1JWK, TestActorA, "cor-ok1", now); err != nil {
+		t.Fatal(err)
+	}
+	def := issuance.Definition{
+		TenantID: TestTenantA, IssuerID: issuerID, ID: "unas-certificate", Version: "1.0.0",
+		ConfigurationID: "unas_ops_pg_v1", DisplayName: "Certificado PG Ops", Locale: "es-PE",
+		Contexts: []string{issuance.CertificateContext}, Types: []string{issuance.CertificateType},
+		DefaultValidity: 365 * 24 * time.Hour, StatusPurposes: []string{issuance.PurposeRevocation, issuance.PurposeSuspension},
+		Fields: map[string]issuance.FieldSpec{"participantName": {Type: "string", Required: true}, "eventName": {Type: "string", Required: true}},
+	}
+	if err := backend.CreateDraftDefinition(testContext, def, TestActorA, "cor-od1", now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backend.PublishDefinition(testContext, TestTenantA, issuerID, def.ID, def.Version, TestActorA, "cor-od2", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.RegisterClient(testContext, TestTenantA, clientID, "Events PG Ops", secret, []string{issuerID}, []string{issuance.ScopeIssuanceCreate, issuance.ScopeIssuanceRead, issuance.ScopeStatusWrite}, nil, TestActorA, "cor-oc1", now); err != nil {
+		t.Fatal(err)
+	}
+
+	claimsKey := make([]byte, 32)
+	_, _ = rand.Read(claimsKey)
+	svc, err := issuance.NewService(issuance.ServiceConfig{
+		ClaimsKey:           claimsKey,
+		ClaimsKeyVersion:    "pg-ops-1",
+		Backend:             backend,
+		AuthorizationServer: "https://auth.hukid.pe",
+		Now:                 clk,
+		Signers: func(_, _, issuerURI, kid, _ string, _ *ecdsa.PublicKey) (issuance.Signer, error) {
+			return issuance.NewMemorySigner(issuerURI, kid, k1, nil)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tokResp, err := svc.ClientCredentialsToken(clientID, secret, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authTok, _ := svc.AuthenticateIntegration(tokResp.AccessToken)
+	holder, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+
+	// 1. Immediate credential -> suspend/reactivate/revoke via operator method.
+	immReq, _, err := svc.CreateIssuanceRequest(authTok, "pg-ops-imm-00001", issuance.IssuanceRequestInput{
+		IssuerID: issuerID, CredentialDefinition: "unas-certificate@1.0.0",
+		Claims: map[string]any{"participantName": "PG Operator", "eventName": "Cloud"},
+		Source: &issuance.SourceInput{System: "events", Reference: "pg-imm-ref"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	immOffer, _ := svc.ResolveOffer("unas-ops-pg", immReq.CredentialOfferURI[strings.LastIndex(immReq.CredentialOfferURI, "ofr_"):])
+	immVCI, _ := svc.PreAuthorizedToken(immOffer.Grants[issuance.PreAuthorizedGrantType].PreAuthorizedCode)
+	immNonce, _ := svc.IssueNonce("unas-ops-pg")
+	immProof, _ := issuance.BuildHolderProof(holder, "https://issuer.hukid.pe/unas-ops-pg", immNonce, now, nil)
+	if _, err := svc.RequestCredential("unas-ops-pg", immVCI.AccessToken, issuance.CredentialRequest{
+		CredentialIdentifier: immVCI.AuthorizationDetails[0].CredentialIdentifiers[0],
+		Proofs: struct {
+			JWT []string `json:"jwt"`
+		}{JWT: []string{immProof}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	polledImm, _ := svc.GetRequest(authTok, immReq.ID)
+	if _, err := svc.OperatorChangeCredentialStatus(TestTenantA, polledImm.CredentialID, "suspend", TestActorA, "cor-pg-s1", issuance.StatusChangeInput{ReasonCode: "operator_request"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.OperatorChangeCredentialStatus(TestTenantA, polledImm.CredentialID, "reactivate", TestActorA, "cor-pg-r1", issuance.StatusChangeInput{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.OperatorChangeCredentialStatus(TestTenantA, polledImm.CredentialID, "revoke", TestActorA, "cor-pg-v1", issuance.StatusChangeInput{ReasonCode: "security_response"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Deferred failure -> DLQ replay -> fulfill -> retrieve -> retention purge.
+	defReq, _, err := svc.CreateIssuanceRequest(authTok, "pg-ops-def-00001", issuance.IssuanceRequestInput{
+		IssuerID: issuerID, CredentialDefinition: "unas-certificate@1.0.0",
+		Claims:   map[string]any{"participantName": "PG Deferred", "eventName": "Cloud"},
+		Delivery: &issuance.DeliveryInput{Deferred: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defOffer, _ := svc.ResolveOffer("unas-ops-pg", defReq.CredentialOfferURI[strings.LastIndex(defReq.CredentialOfferURI, "ofr_"):])
+	defVCI, _ := svc.PreAuthorizedToken(defOffer.Grants[issuance.PreAuthorizedGrantType].PreAuthorizedCode)
+	defNonce, _ := svc.IssueNonce("unas-ops-pg")
+	defProof, _ := issuance.BuildHolderProof(holder, "https://issuer.hukid.pe/unas-ops-pg", defNonce, now, nil)
+	out, err := svc.RequestCredential("unas-ops-pg", defVCI.AccessToken, issuance.CredentialRequest{
+		CredentialIdentifier: defVCI.AuthorizationDetails[0].CredentialIdentifiers[0],
+		Proofs: struct {
+			JWT []string `json:"jwt"`
+		}{JWT: []string{defProof}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.FailDeferredRequest(TestTenantA, defReq.ID, "kms_down"); err != nil {
+		t.Fatal(err)
+	}
+	metrics, err := svc.OperationalMetrics(TestTenantA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metrics.DeferredFailedDLQ != 1 || metrics.RevokedCredentials != 1 {
+		t.Fatalf("unexpected PG metrics: %+v", metrics)
+	}
+	if err := svc.ReplayFailedDeferredRequest(TestTenantA, defReq.ID, TestActorA, "cor-pg-dlq"); err != nil {
+		t.Fatal(err)
+	}
+	if fulfilled, err := svc.FulfillPendingDeferredRequests(TestTenantA, 10); err != nil || fulfilled != 1 {
+		t.Fatalf("fulfill after replay failed: fulfilled=%d err=%v", fulfilled, err)
+	}
+	if vcJWT, _, err := svc.DeferredCredential("unas-ops-pg", defVCI.AccessToken, out.TransactionID); err != nil || vcJWT == "" {
+		t.Fatalf("retrieve deferred VC failed: err=%v", err)
+	}
+
+	// 3. Uncollected fulfilled deferred VC -> retention shreds vc_ciphertext after cutoff.
+	uncollectedReq, _, err := svc.CreateIssuanceRequest(authTok, "pg-ops-uncol-0001", issuance.IssuanceRequestInput{
+		IssuerID: issuerID, CredentialDefinition: "unas-certificate@1.0.0",
+		Claims:   map[string]any{"participantName": "PG Uncollected", "eventName": "Cloud"},
+		Delivery: &issuance.DeliveryInput{Deferred: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	uncollectedOffer, _ := svc.ResolveOffer("unas-ops-pg", uncollectedReq.CredentialOfferURI[strings.LastIndex(uncollectedReq.CredentialOfferURI, "ofr_"):])
+	uncollectedVCI, _ := svc.PreAuthorizedToken(uncollectedOffer.Grants[issuance.PreAuthorizedGrantType].PreAuthorizedCode)
+	uncollectedNonce, _ := svc.IssueNonce("unas-ops-pg")
+	uncollectedProof, _ := issuance.BuildHolderProof(holder, "https://issuer.hukid.pe/unas-ops-pg", uncollectedNonce, now, nil)
+	if _, err := svc.RequestCredential("unas-ops-pg", uncollectedVCI.AccessToken, issuance.CredentialRequest{
+		CredentialIdentifier: uncollectedVCI.AuthorizationDetails[0].CredentialIdentifiers[0],
+		Proofs: struct {
+			JWT []string `json:"jwt"`
+		}{JWT: []string{uncollectedProof}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if fulfilled2, err := svc.FulfillPendingDeferredRequests(TestTenantA, 10); err != nil || fulfilled2 != 1 {
+		t.Fatalf("fulfill uncollected pg deferred failed: fulfilled=%d err=%v", fulfilled2, err)
+	}
+
+	now = now.Add(8 * 24 * time.Hour)
+	summary, err := svc.PurgeExpiredMaterial(TestTenantA, 7*24*time.Hour, 100, "system:retention", "cor-pg-ret1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.ShreddedRequests != 3 || summary.ShreddedDeferredVCs != 1 {
+		t.Fatalf("unexpected PG retention summary: %+v", summary)
+	}
+	assertCleared(t, pool)
+}
