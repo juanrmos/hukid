@@ -7,10 +7,21 @@ Aplica a `deploy/staging/compose.yaml` en Dokploy ([ADR-0029](../decisions/ADR-0
 Una sola vez, tras el primer despliegue, con `docker compose --profile tools run --rm tools ...`:
 
 1. `migrate`: aplica las migraciones SQL con la cuenta propietaria (`hukid_admin`).
-2. `runtime-logins`: crea los cinco logins de ejecución `hukid_staging_<rol>` (`session`, `context`, `tenant`, `members`, `dashboard`), `NOSUPERUSER`, solo con la pertenencia a su rol.
+2. `runtime-logins`: crea los seis logins de ejecución `hukid_staging_<rol>` (`session`, `context`, `tenant`, `members`, `dashboard`, `issuance`), `NOSUPERUSER`, solo con la pertenencia a su rol.
 3. `bootstrap <issuer> <subject> "<nombre del tenant>"`: crea un tenant y liga una identidad real como `tenant_admin`.
 
 El `subject` es el identificador `sub` del usuario en Keycloak (un UUID). No se puede deducir: hay que leerlo del usuario real.
+
+## Activación del Issuer (overlay preparado, no ejecutado en el host)
+
+La configuración de emisión es un overlay para que las operaciones de base de datos sigan disponibles antes de configurar Vault. En el VPS, desde el checkout de Dokploy y usando las variables del gestor de secretos. Crea primero una KEK Transit `aes256-gcm96` con `derived=true` (el cliente aporta AAD/context), permisos mínimos de encrypt/decrypt; el proceso de firma requiere además los permisos que correspondan a sus llaves issuer. No reemplaces una DEK ya envuelta: hacerlo sin re-encriptar datos dejaría claims existentes ilegibles. Obtén la CA TLS de PostgreSQL y usa un hostname cuyo SAN coincida; `HUKID_POSTGRES_CA_FILE` debe ser una ruta absoluta legible por Docker Compose en el host.
+
+1. Configura en Dokploy las variables `HUKID_RUNTIME_PASSWORD_ISSUANCE`, `HUKID_ISSUANCE_*` y `HUKID_VAULT_*` según [staging-verification.md](staging-verification.md). `HUKID_ISSUANCE_CLAIMS_KEY_CIPHERTEXT` se genera con `node scripts/wrap-staging-claims-key.mjs`; la DEK se crea en memoria y solo se conserva la forma envuelta por Transit.
+2. Antes de reiniciar el API, ejecuta la imagen de herramientas (sin overlay) para aplicar migraciones, crear los logins y completar el bootstrap documentado arriba. `runtime-logins` ahora crea también `hukid_staging_issuance`.
+3. Configura Dokploy para componer `deploy/staging/compose.yaml` con `deploy/staging/compose.issuer.yaml`, redespliega la aplicación y comprueba `/healthz`, discovery del issuer y JWKS por HTTPS.
+4. Solo después de bootstrap y de establecer `HUKID_ISSUANCE_TENANT_ID`, activa `issuer-workers` con el overlay. El worker diferido procesa hasta 50 cada 5 minutos; retención procesa hasta 500 cada hora con TTL inicial de 168 horas. El owner debe ratificar TTL/retención antes de usarlo con datos de piloto.
+
+El procedimiento anterior es una guía de configuración del repo, no evidencia de que se haya cambiado Dokploy, Vault o la instancia staging. El overlay requiere URL Vault HTTPS, token Transit con permisos limitados a la KEK, ciphertext vigente y URLs públicas correctas. No pegues secretos en logs, terminales compartidas ni documentación.
 
 ## Membresía huérfana por un `bootstrap` con subject inventado
 

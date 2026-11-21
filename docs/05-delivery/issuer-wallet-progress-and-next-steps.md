@@ -80,14 +80,12 @@ Partiendo del scaffold de `FarisR2/hukid` (`feat/wallet-functional`, commit `460
    - *(Opcional UX)* Agregar lector QR con cámara en `src/wallet/` para no depender solo de pegar el enlace o usar deep link.
 
 ### Paso 2 — Desplegar el Issuer en `staging` (replicando el patrón de `FEAT-004`)
-El binario del API y el worker ya se compilan en `Dockerfile.api`, pero falta completar estos huecos en infraestructura de staging:
-1. **Conciliar `upstream/develop` (`ad22ee2..26fa455`):** al integrar lo último de verificación, renumerar la migración `0015_verification_maintenance.sql` para evitar choque con `0015_issuer_foundation.sql` (`0019_...` en nuestra rama) y ajustar el conteo en tests de persistencia.
-2. **Proxy web ([Caddyfile](../../deploy/staging/Caddyfile)):** añadir `reverse_proxy 127.0.0.1:8080` para las rutas OID4VCI y M2M (`/{slug}/.well-known/*`, `/.well-known/oauth-authorization-server`, `/oauth2/token`, `/v1/*`, `/{slug}/offers/*`, `/{slug}/nonce`, `/{slug}/credential`, `/{slug}/deferred_credential`, `/{slug}/status/*`, `/{slug}/schemas/*`, `/{slug}/contexts/*`), ya que hoy solo reenvía `/console/*`, `/healthz` y rutas de verificación.
-3. **Provisioning DB (`staging_provision.go`, `cmd/stagingdb/main.go` y [staging-secrets.mjs](../../scripts/staging-secrets.mjs)):** añadir `"issuance"` a `RuntimeLoginRoles` y generar `HUKID_RUNTIME_PASSWORD_ISSUANCE`.
-4. **Vault Transit con HTTPS + Worker ([compose.yaml](../../deploy/staging/compose.yaml)):**
-   - Levantar Vault Transit accesible por `https://` desde `api` y `hukid-worker` (requisito de runtime en `HUKID_ENV=staging`), crear KEK para claims y envolver `HUKID_ISSUANCE_CLAIMS_KEY_CIPHERTEXT`.
-   - Añadir las variables `HUKID_ISSUANCE_*` y `HUKID_VAULT_*` en `api` (fijando `HUKID_ISSUANCE_PUBLIC_URL` al dominio HTTPS público) y un servicio/cron para `/app/hukid-worker`.
-   - Documentar el alta y verificación en [staging-architecture.md](./staging-architecture.md), [staging-operations.md](./staging-operations.md) y [staging-verification.md](./staging-verification.md).
+El binario API/worker y los archivos de runtime de staging están en el repo. En este incremento se implementaron las piezas configurables:
+1. **Migraciones:** el árbol actual ya contiene `0013_verification_sessions.sql`, `0014_verifier_keys.sql` y las migraciones de issuer `0015`–`0018`; no renumerar `0015`. Comparar `upstream/develop` solo al integrar una actualización nueva.
+2. **Proxy web:** completado en [`Caddyfile`](../../deploy/staging/Caddyfile): discovery/JWKS, OID4VCI, OAuth y `/v1/*` se reenvían al API.
+3. **Provisioning y secretos:** completado en `staging_provision.go`, `cmd/stagingdb`, [`staging-secrets.mjs`](../../scripts/staging-secrets.mjs) y [`wrap-staging-claims-key.mjs`](../../scripts/wrap-staging-claims-key.mjs); incluye login aislado `issuance` y wrap de DEK sin persistir plaintext.
+4. **Runtime y workers:** completado en [`compose.issuer.yaml`](../../deploy/staging/compose.issuer.yaml); el overlay añade configuración de API con PostgreSQL TLS y workers `deferred`/`retention` de perfil optativo.
+5. **Operación:** runbooks y checklist actualizados en [staging-architecture.md](./staging-architecture.md), [staging-operations.md](./staging-operations.md) y [staging-verification.md](./staging-verification.md). Aplicar overlay y validar en el host sigue pendiente: hacen falta endpoint/policy/token reales de Vault, tenant piloto y evidencia HTTPS. Este checkout no hizo deploy remoto.
 
 ### Paso 3 — Integración externa completa (`Team 4` + Wallet + Verifier)
 1. Conectar el **adaptador outbound de Team 4 (Events)** contra `POST /oauth2/token`, `POST /v1/issuance-requests` y `GET /v1/issuance-requests/{id}` (usando un cliente M2M creado desde Consola).
