@@ -673,7 +673,8 @@ class Oid4vciOfferAdapter implements OfferAdapter {
   }
 
   bool _supportsVCDMProofProfile(Map<String, dynamic> cfg) {
-    if (cfg['format'] != 'vc+jwt') return false;
+    final format = cfg['format'];
+    if (format != 'vc+jwt' && format != 'application/vc+jwt') return false;
     final algs = cfg['credential_signing_alg_values_supported'];
     if (algs is! List<dynamic> || !algs.contains('ES256')) return false;
     final proofTypes = cfg['proof_types_supported'];

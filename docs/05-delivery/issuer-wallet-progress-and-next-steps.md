@@ -88,9 +88,10 @@ El binario API/worker y los archivos de runtime de staging están en el repo. En
 5. **Operación:** runbooks y checklist actualizados en [staging-architecture.md](./staging-architecture.md), [staging-operations.md](./staging-operations.md) y [staging-verification.md](./staging-verification.md). Aplicar overlay y validar en el host sigue pendiente: hacen falta endpoint/policy/token reales de Vault, tenant piloto y evidencia HTTPS. Este checkout no hizo deploy remoto.
 
 ### Paso 3 — Integración externa completa (`Team 4` + Wallet + Verifier)
+Consulta el plan detallado de las 5 etapas, incluyendo conciliación de migraciones y compatibilidad de credenciales con el Validador en staging, en [integration-roadmap.md](./integration-roadmap.md).
 1. Conectar el **adaptador outbound de Team 4 (Events)** contra `POST /oauth2/token`, `POST /v1/issuance-requests` y `GET /v1/issuance-requests/{id}` (usando un cliente M2M creado desde Consola).
 2. Evaluar soporte de **`tx_code` (OID4VCI v0.1)** si el piloto exige segundo factor al canjear la oferta.
-3. Implementar la parte **OID4VP (presentación hacia el Verifier)** en `src/wallet/` para cerrar el ciclo completo `Events -> Issuer -> Wallet -> Verifier`.
+3. Parte **OID4VP (presentación hacia el Verifier)** implementada en `src/wallet/` (`crypto_jwe.dart`, `oid4vp_client.dart`, `MainActivity.kt` y `PresentPage` en `main.dart`); resta prueba de extremo a extremo contra el Validador desplegado en staging tras compilar el APK y registrar la llave del emisor en `issuer-keys.json`.
 
 ### Paso 4 — Cierre operativo en la nube (`HK-055` y `HK-056`)
 1. Ejecutar el **drill PITR real** de PostgreSQL + verificación de consistencia con Vault Transit documentando `RPO` y `RTO` observados.

@@ -28,6 +28,7 @@
                 <category android:name="android.intent.category.DEFAULT"/>
                 <category android:name="android.intent.category.BROWSABLE"/>
                 <data android:scheme="openid-credential-offer"/>
+                <data android:scheme="openid4vp"/>
             </intent-filter>
         </activity>
         <meta-data

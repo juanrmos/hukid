@@ -112,7 +112,7 @@ class MainActivity : FlutterActivity() {
 
     private fun captureDeepLink(intent: Intent?, dispatch: Boolean) {
         val raw = intent?.dataString?.trim() ?: return
-        if (!raw.startsWith("openid-credential-offer://")) return
+        if (!raw.startsWith("openid-credential-offer://") && !raw.startsWith("openid4vp://")) return
         if (dispatch && deepLinkChannel != null) {
             deepLinkChannel?.invokeMethod("onLink", raw)
         } else {

@@ -6,6 +6,7 @@ import 'package:material_ui/material_ui.dart';
 import 'issuance.dart';
 import 'keystore.dart';
 import 'oid4vci_client.dart';
+import 'oid4vp_client.dart';
 
 const bool _allowInsecureLoopback = bool.fromEnvironment(
   'HUKID_ALLOW_INSECURE_LOOPBACK',
@@ -17,6 +18,7 @@ class WalletApp extends StatelessWidget {
   const WalletApp({
     super.key,
     this.adapter = const UnavailableIssuer(),
+    this.presentationAdapter = const UnavailableVerifier(),
     this.vault,
     this.enableDeepLinks = false,
   });
@@ -36,15 +38,22 @@ class WalletApp extends StatelessWidget {
       httpClient: httpClient,
       config: config,
     );
+    final presentationAdapter = Oid4vpPresentationAdapter(
+      keyStore: keyStore,
+      httpClient: httpClient,
+      config: config,
+    );
     return WalletApp(
       key: key,
       adapter: adapter,
+      presentationAdapter: presentationAdapter,
       vault: vault,
       enableDeepLinks: true,
     );
   }
 
   final OfferAdapter adapter;
+  final PresentationAdapter presentationAdapter;
   final CredentialVault? vault;
   final bool enableDeepLinks;
 
@@ -69,6 +78,7 @@ class WalletApp extends StatelessWidget {
     ),
     home: WalletHome(
       adapter: adapter,
+      presentationAdapter: presentationAdapter,
       vault: vault,
       enableDeepLinks: enableDeepLinks,
     ),
@@ -79,11 +89,13 @@ class WalletHome extends StatefulWidget {
   const WalletHome({
     super.key,
     this.adapter = const UnavailableIssuer(),
+    this.presentationAdapter = const UnavailableVerifier(),
     this.vault,
     this.enableDeepLinks = false,
   });
 
   final OfferAdapter adapter;
+  final PresentationAdapter presentationAdapter;
   final CredentialVault? vault;
   final bool enableDeepLinks;
 
@@ -103,10 +115,16 @@ class _WalletHomeState extends State<WalletHome> {
   @override
   void initState() {
     super.initState();
-    unawaited(_reloadVault());
     if (widget.enableDeepLinks) {
       _deepLinkChannel.setMethodCallHandler(_handleDeepLinkCall);
-      unawaited(_consumeInitialDeepLink());
+    }
+    unawaited(_bootstrap());
+  }
+
+  Future<void> _bootstrap() async {
+    await _reloadVault();
+    if (widget.enableDeepLinks && mounted) {
+      await _consumeInitialDeepLink();
     }
   }
 
@@ -120,7 +138,7 @@ class _WalletHomeState extends State<WalletHome> {
 
   Future<void> _handleDeepLinkCall(MethodCall call) async {
     if (call.method == 'onLink' && call.arguments is String) {
-      await _openReceivePage(initialLink: call.arguments as String);
+      await _openDeepLink(call.arguments as String);
     }
   }
 
@@ -130,10 +148,19 @@ class _WalletHomeState extends State<WalletHome> {
         'consumeInitialLink',
       );
       if (link != null && link.isNotEmpty && mounted) {
-        await _openReceivePage(initialLink: link);
+        await _openDeepLink(link);
       }
     } catch (_) {
       // Ignora canal no disponible en plataformas sin soporte nativo.
+    }
+  }
+
+  Future<void> _openDeepLink(String rawLink) async {
+    final trimmed = rawLink.trim();
+    if (trimmed.startsWith(oid4vpScheme)) {
+      await _openPresentPage(initialLink: trimmed);
+    } else {
+      await _openReceivePage(initialLink: trimmed);
     }
   }
 
@@ -164,6 +191,20 @@ class _WalletHomeState extends State<WalletHome> {
       ),
     );
     await _reloadVault();
+  }
+
+  Future<void> _openPresentPage({String? initialLink}) async {
+    await _reloadVault();
+    if (!mounted) return;
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (_) => PresentPage(
+          adapter: widget.presentationAdapter,
+          credentials: _credentials,
+          initialLink: initialLink,
+        ),
+      ),
+    );
   }
 
   Future<void> _pollPendingItem(PendingDeferredIssuance item) async {
@@ -270,17 +311,23 @@ class _WalletHomeState extends State<WalletHome> {
               const SizedBox(height: 12),
               Text(_statusNote!),
             ],
-            const SizedBox(height: 24),
+            const SizedBox(height: 16),
             FilledButton.icon(
               icon: const Icon(Icons.add),
               label: const Text('Recibir credencial'),
               onPressed: () => unawaited(_openReceivePage()),
             ),
-            const SizedBox(height: 24),
+            const SizedBox(height: 12),
+            OutlinedButton.icon(
+              icon: const Icon(Icons.verified_user_outlined),
+              label: const Text('Presentar credencial'),
+              onPressed: () => unawaited(_openPresentPage()),
+            ),
+            const SizedBox(height: 16),
             Text(
               isLab
                   ? 'Laboratorio Android · Sin emisor configurado.'
-                  : 'HukID Wallet · OID4VCI + Android Keystore (ES256 / AES-GCM).',
+                  : 'HukID Wallet · OID4VCI + OID4VP + Android Keystore.',
             ),
             if (isLab)
               const Text('Sin cámara, recepción real ni almacenamiento todavía.'),
@@ -463,6 +510,210 @@ class _ReceivePageState extends State<ReceivePage> {
               child: Text(
                 flow.state == ReceiptState.stored ? 'Volver' : 'Cancelar',
               ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class PresentPage extends StatefulWidget {
+  const PresentPage({
+    super.key,
+    required this.adapter,
+    required this.credentials,
+    this.initialLink,
+  });
+
+  final PresentationAdapter adapter;
+  final List<StoredCredential> credentials;
+  final String? initialLink;
+
+  @override
+  State<PresentPage> createState() => _PresentPageState();
+}
+
+class _PresentPageState extends State<PresentPage> {
+  final TextEditingController _input = TextEditingController();
+  PresentationRequestSummary? _request;
+  String? _selectedCredentialId;
+  bool _busy = false;
+  bool _submitted = false;
+  String? _statusNote;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.credentials.isNotEmpty) {
+      _selectedCredentialId = widget.credentials.first.id;
+    }
+    final initial = widget.initialLink?.trim();
+    if (initial != null && initial.isNotEmpty) {
+      _input.text = initial;
+      unawaited(_fetchRequest());
+    }
+  }
+
+  @override
+  void dispose() {
+    _input.dispose();
+    super.dispose();
+  }
+
+  StoredCredential? get _selectedCredential {
+    for (final cred in widget.credentials) {
+      if (cred.id == _selectedCredentialId) return cred;
+    }
+    return null;
+  }
+
+  Future<void> _fetchRequest() async {
+    setState(() {
+      _busy = true;
+      _request = null;
+      _submitted = false;
+      _statusNote = null;
+    });
+    try {
+      final summary = await widget.adapter.fetchRequest(_input.text);
+      if (!mounted) return;
+      setState(() {
+        _request = summary;
+        _busy = false;
+      });
+    } catch (err) {
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _statusNote = err.toString();
+      });
+    }
+  }
+
+  Future<void> _submitPresentation() async {
+    final req = _request;
+    final cred = _selectedCredential;
+    if (req == null || cred == null) return;
+    setState(() {
+      _busy = true;
+      _statusNote = null;
+    });
+    try {
+      final outcome = await widget.adapter.presentCredential(
+        request: req,
+        credential: cred,
+      );
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _submitted = outcome.state == PresentationState.submitted;
+        _statusNote = outcome.state == PresentationState.submitted
+            ? 'Presentación enviada al validador.'
+            : (outcome.detail ?? 'El validador rechazó la presentación.');
+      });
+    } catch (err) {
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _statusNote = err.toString();
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final req = _request;
+    return Scaffold(
+      appBar: AppBar(title: const Text('Presentar credencial')),
+      body: SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.all(24),
+          children: [
+            Text(
+              widget.adapter is UnavailableVerifier
+                  ? 'Sin validador configurado. No se enviarán datos reales.'
+                  : 'Pega el enlace openid4vp:// emitido por el validador.',
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: _input,
+              autocorrect: false,
+              enableSuggestions: false,
+              decoration: const InputDecoration(
+                labelText: 'Enlace de verificación',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 16),
+            FilledButton(
+              onPressed: _busy ? null : () => unawaited(_fetchRequest()),
+              child: Text(_busy && req == null ? 'Consultando…' : 'Consultar solicitud'),
+            ),
+            if (req != null) ...[
+              const SizedBox(height: 20),
+              Card(
+                color: const Color(0xfff3effb),
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Solicitud de verificación',
+                        style: Theme.of(context).textTheme.titleMedium,
+                      ),
+                      const SizedBox(height: 6),
+                      Text('Validador: ${req.clientId}'),
+                      Text('Consulta: ${req.credentialQueryId}'),
+                      Text('Expira: ${req.expiresAt.toIso8601String()}'),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+              if (widget.credentials.isEmpty)
+                const Text('No hay credenciales almacenadas en tu wallet.')
+              else ...[
+                Text(
+                  'Selecciona una credencial',
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
+                const SizedBox(height: 8),
+                ...widget.credentials.map(
+                  (cred) => Card(
+                    child: ListTile(
+                      leading: Icon(
+                        cred.id == _selectedCredentialId
+                            ? Icons.radio_button_checked
+                            : Icons.radio_button_unchecked,
+                      ),
+                      title: Text(cred.title),
+                      subtitle: Text(cred.issuerDisplayName),
+                      selected: cred.id == _selectedCredentialId,
+                      onTap: _busy
+                          ? null
+                          : () => setState(() => _selectedCredentialId = cred.id),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                FilledButton(
+                  onPressed: _busy || _selectedCredential == null || _submitted
+                      ? null
+                      : () => unawaited(_submitPresentation()),
+                  child: Text(_busy ? 'Enviando…' : 'Presentar'),
+                ),
+              ],
+            ],
+            if (_statusNote != null) ...[
+              const SizedBox(height: 16),
+              Semantics(liveRegion: true, child: Text(_statusNote!)),
+            ],
+            const SizedBox(height: 16),
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: Text(_submitted ? 'Volver' : 'Cancelar'),
             ),
           ],
         ),

@@ -3,6 +3,10 @@ import 'dart:math';
 import 'dart:typed_data';
 
 const String oid4vciProofJwtType = 'openid4vci-proof+jwt';
+const String oid4vpPresentationJwtType = 'vp+jwt';
+const String vcdmBaseContext = 'https://www.w3.org/ns/credentials/v2';
+const String hukidPresentationContext =
+    'https://schemas.hukid.pe/contexts/presentation/v1';
 
 Uint8List _u32FractionBits(int prime, double rootExponent) {
   final val = pow(prime.toDouble(), rootExponent).toDouble();
@@ -452,6 +456,27 @@ class P256Curve {
     return _modN(x) == r;
   }
 
+  /// Computes the 32-byte big-endian X-coordinate ECDH shared secret Z
+  /// between [privateKey] and [peerPublicKey] on NIST P-256.
+  static Uint8List ecdhSharedSecret(
+    BigInt privateKey,
+    PublicEcJwk peerPublicKey,
+  ) {
+    if (privateKey <= BigInt.zero || privateKey >= n) {
+      throw ArgumentError('ECDH private scalar out of range');
+    }
+    final peerX = peerPublicKey.xBigInt;
+    final peerY = peerPublicKey.yBigInt;
+    if (!isOnCurve(peerX, peerY)) {
+      throw const FormatException('peer public key is not on P-256');
+    }
+    final shared = _scalarMul(privateKey, peerX, peerY);
+    if (shared == null || !isOnCurve(shared.x, shared.y)) {
+      throw StateError('ECDH produced point at infinity');
+    }
+    return _bigIntTo32Bytes(shared.x);
+  }
+
   static _JacobianPoint _scalarMulAffineJacobian(
     BigInt scalar,
     BigInt px,
@@ -488,6 +513,24 @@ class P256KeyPair {
       }
     }
   }
+
+  factory P256KeyPair.fromPrivateBytes(List<int> privateBytes, {String? kid}) {
+    if (privateBytes.length != 32) {
+      throw ArgumentError('P-256 private scalar must be 32 bytes');
+    }
+    final d = _bytesToBigInt(privateBytes);
+    if (d <= BigInt.zero || d >= P256Curve.n) {
+      throw ArgumentError('P-256 private scalar out of range');
+    }
+    final pt = P256Curve._scalarMul(d, P256Curve.gx, P256Curve.gy);
+    if (pt == null || !P256Curve.isOnCurve(pt.x, pt.y)) {
+      throw StateError('invalid P-256 key pair');
+    }
+    return P256KeyPair._(d, PublicEcJwk.fromPoint(pt.x, pt.y, kid: kid));
+  }
+
+  Uint8List ecdhSharedSecret(PublicEcJwk peerPublicKey) =>
+      P256Curve.ecdhSharedSecret(_d, peerPublicKey);
 
   Uint8List signEs256(List<int> message, {Random? random}) {
     final rng = random ?? Random.secure();
@@ -534,6 +577,54 @@ Future<String> buildHolderProofJwt({
     'aud': audience,
     'nonce': nonce,
     'iat': (issuedAt ?? DateTime.now()).toUtc().millisecondsSinceEpoch ~/ 1000,
+  };
+  final headerB64 = base64UrlNoPadEncode(utf8.encode(jsonEncode(header)));
+  final payloadB64 = base64UrlNoPadEncode(utf8.encode(jsonEncode(payload)));
+  final signingInput = '$headerB64.$payloadB64';
+  final sig64 = await signEs256(Uint8List.fromList(utf8.encode(signingInput)));
+  if (sig64.length != 64) {
+    throw StateError('expected 64-byte raw ES256 signature');
+  }
+  return '$signingInput.${base64UrlNoPadEncode(sig64)}';
+}
+
+/// Builds a compact VCDM 2.0 `vp+jwt` presentation wrapping [credentials]
+/// as `EnvelopedVerifiableCredential` data URLs, bound to [audience] and [nonce].
+Future<String> buildVerifiablePresentationJwt({
+  required PublicEcJwk holderPublicJwk,
+  required Es256Signer signEs256,
+  required String audience,
+  required String nonce,
+  required List<String> credentials,
+}) async {
+  if (audience.isEmpty || nonce.isEmpty) {
+    throw ArgumentError('audience and nonce must not be empty');
+  }
+  if (credentials.isEmpty) {
+    throw ArgumentError('credentials must not be empty');
+  }
+  final enveloped = <Map<String, dynamic>>[
+    for (final vc in credentials)
+      if (vc.trim().isEmpty)
+        throw ArgumentError('credential JWT must not be empty')
+      else
+        <String, dynamic>{
+          '@context': vcdmBaseContext,
+          'id': 'data:application/vc+jwt,${vc.trim()}',
+          'type': 'EnvelopedVerifiableCredential',
+        },
+  ];
+  final header = <String, dynamic>{
+    'alg': 'ES256',
+    'typ': oid4vpPresentationJwtType,
+    'jwk': holderPublicJwk.toProofHeaderJwk(),
+  };
+  final payload = <String, dynamic>{
+    '@context': <String>[vcdmBaseContext, hukidPresentationContext],
+    'type': <String>['VerifiablePresentation'],
+    'aud': audience,
+    'nonce': nonce,
+    'verifiableCredential': enveloped,
   };
   final headerB64 = base64UrlNoPadEncode(utf8.encode(jsonEncode(header)));
   final payloadB64 = base64UrlNoPadEncode(utf8.encode(jsonEncode(payload)));

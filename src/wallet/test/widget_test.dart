@@ -1,7 +1,9 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:hukid_wallet/crypto_p256.dart';
 import 'package:hukid_wallet/issuance.dart';
 import 'package:hukid_wallet/keystore.dart';
 import 'package:hukid_wallet/main.dart';
+import 'package:hukid_wallet/oid4vp_client.dart';
 import 'package:material_ui/material_ui.dart';
 
 import 'issuance_test.dart' show TestIssuer;
@@ -157,4 +159,91 @@ void main() {
     expect(find.text('No se guardó ninguna credencial.'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
+
+  testWidgets('WalletHome navigates to PresentPage and submits presentation', (
+    tester,
+  ) async {
+    final fakeVerifier = _FakePresentationAdapter();
+    final vault = MemoryCredentialVault();
+    const cred = StoredCredential(
+      id: 'cred_vp_ui_1',
+      credentialIssuer: 'https://issuer.hukid.pe/unas',
+      configurationId: 'event_participation_v1',
+      title: 'Certificado UNAS',
+      issuerDisplayName: 'UNAS Cloud',
+      holderJkt: 'thumbprint_ui_1',
+      keyAlias: 'hukid_key_ui_1',
+      vcJwt: 'hdr.pay.sig',
+      receivedAtIso: '2026-11-23T12:00:00Z',
+    );
+    await vault.saveCredential(cred);
+
+    await tester.pumpWidget(
+      WalletApp(
+        presentationAdapter: fakeVerifier,
+        vault: vault,
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Presentar credencial'));
+    await tester.pumpAndSettle();
+    await tester.enterText(
+      find.byType(TextField),
+      'openid4vp://authorize?client_id=x509_san_dns%3Ahukid.zentrycore.com&request_uri=https%3A%2F%2Fhukid.zentrycore.com%2Foid4vp%2Frequest%2Fs1',
+    );
+    await tester.tap(find.text('Consultar solicitud'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Certificado UNAS'), findsOneWidget);
+    expect(find.text('Consulta: event_cred'), findsOneWidget);
+    final presentBtn = find.widgetWithText(FilledButton, 'Presentar');
+    await tester.scrollUntilVisible(
+      presentBtn,
+      200,
+      scrollable: pageListScrollable(find.byType(PresentPage)),
+    );
+    await tester.ensureVisible(presentBtn);
+    await tester.pumpAndSettle();
+    await tester.tap(presentBtn);
+    await tester.pumpAndSettle();
+
+    final sentText = find.text('Presentación enviada al validador.');
+    await tester.scrollUntilVisible(
+      sentText,
+      200,
+      scrollable: pageListScrollable(find.byType(PresentPage)),
+    );
+    expect(sentText, findsOneWidget);
+    expect(fakeVerifier.presentedCredential?.id, 'cred_vp_ui_1');
+  });
+}
+
+class _FakePresentationAdapter implements PresentationAdapter {
+  StoredCredential? presentedCredential;
+
+  @override
+  Future<PresentationRequestSummary> fetchRequest(String launchUri) async {
+    final enc = P256KeyPair.generate(kid: 'enc-k1').publicJwk;
+    return PresentationRequestSummary(
+      clientId: 'x509_san_dns:hukid.zentrycore.com',
+      requestUri: Uri.parse('https://hukid.zentrycore.com/oid4vp/request/s1'),
+      responseUri: Uri.parse('https://hukid.zentrycore.com/oid4vp/response'),
+      state: 's1',
+      nonce: 'n1',
+      credentialQueryId: 'event_cred',
+      encryptionKey: enc,
+      expiresAt: DateTime.utc(2027, 1, 1),
+      signatureVerified: true,
+    );
+  }
+
+  @override
+  Future<PresentationOutcome> presentCredential({
+    required PresentationRequestSummary request,
+    required StoredCredential credential,
+  }) async {
+    presentedCredential = credential;
+    return const PresentationOutcome(state: PresentationState.submitted);
+  }
 }
